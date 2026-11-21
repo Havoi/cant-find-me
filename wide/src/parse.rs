@@ -47,7 +47,16 @@ impl Part {
     pub fn empty() -> Part {
         Part { lines: Vec::new(), fill: Vec::new(), cur: Vec::new(), nch: Vec::new(), n: Vec::new(), head: Vec::new(), arena: std::ptr::null(), blk: std::ptr::null_mut(), blk_end: std::ptr::null_mut(), popw: false, pend: Vec::new() }
     }
+    pub fn new_unbound(nb: usize) -> Part {
+        Part::build(std::ptr::null(), nb)
+    }
+    pub fn set_arena(&mut self, arena: &Arena) {
+        self.arena = arena;
+    }
     pub fn new(arena: &Arena, nb: usize) -> Part {
+        Part::build(arena, nb)
+    }
+    fn build(arena: *const Arena, nb: usize) -> Part {
         Part {
             lines: vec![Line([0; 8]); nb],
             fill: vec![0; nb + 64],
@@ -400,6 +409,7 @@ pub unsafe fn init_tabs_shared(prod: *const u8, np: usize, camp: *const u8, nc: 
     let _ = TABS.set(Tabs { prod: v(prod, np), camp: v(camp, nc), crange });
 }
 pub static CORE_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static PARTS_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn camp_range(t: &[u8]) -> Option<(u64, u64)> {
     let lo = t.iter().position(|&c| c != 255)?;
@@ -929,58 +939,166 @@ fn link_slow(c: &mut Ctx, buf: &[u8], s: usize, e: usize) {
     c.t.gen_edges.push((ta, tb));
 }
 
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct LkRow {
+    e: [u8; 32],
+    m: [u8; 32],
+    offa: i64,
+    offb: i64,
+    na: u64,
+    nb: u64,
+    _pad: [u64; 4],
+}
+const LK_ROWS: usize = 32 * 16 + 33;
+const fn lk_rows() -> [LkRow; LK_ROWS] {
+    let mut t = [LkRow { e: [0; 32], m: [0; 32], offa: -1, offb: 0, na: 0, nb: 0, _pad: [0; 4] }; LK_ROWS];
+    let mut c0 = 2;
+    while c0 <= 11 {
+        let mut rb = 2;
+        while rb <= 11 {
+            let nl = c0 + 1 + rb;
+            let (qa, qb) = ((c0 >= 10) as usize, (rb >= 10) as usize);
+            let mut r = LkRow { e: [0; 32], m: [0; 32], offa: 1 + qa as i64, offb: (c0 + 2 + qb) as i64, na: (c0 - 1 - 2 * qa) as u64, nb: (rb - 1 - 2 * qb) as u64, _pad: [0; 4] };
+            let f = [(0, c0, qa), (c0 + 1, nl, qb)];
+            let mut k = 0;
+            while k < 2 {
+                let (s, e, q) = f[k];
+                if q == 1 {
+                    r.e[s] = b'"';
+                    r.m[s] = 0xFF;
+                    r.e[e - 1] = b'"';
+                    r.m[e - 1] = 0xFF;
+                }
+                r.e[s + q] = b'u';
+                r.m[s + q] = 0xFF;
+                k += 1;
+            }
+            r.e[c0] = b',';
+            r.m[c0] = 0xFF;
+            r.e[nl] = b'\n';
+            r.m[nl] = 0xFF;
+            t[nl * 16 + c0] = r;
+            rb += 1;
+        }
+        c0 += 1;
+    }
+    t
+}
+static LKP: [LkRow; LK_ROWS] = lk_rows();
+const _: () = assert!(std::mem::size_of::<LkRow>() == 128 && std::mem::offset_of!(LkRow, m) == 32 && std::mem::offset_of!(LkRow, offa) == 64 && std::mem::offset_of!(LkRow, na) == 80);
+
+const LK_REACH: usize = 40;
+
+#[inline(never)]
+unsafe fn lk_loop(p: *const u8, lim: *const u8, lb: *mut LkBatch, n: usize) -> (u64, *const u8, usize) {
+    let (code, np, nn): (u64, *const u8, usize);
+    unsafe {
+        std::arch::asm!(
+            "mov eax, 0x0a0a0a0a",
+            "vmovd xmm14, eax",
+            "vpbroadcastd ymm14, xmm14",
+            "mov eax, 0x2c2c2c2c",
+            "vmovd xmm15, eax",
+            "vpbroadcastd ymm15, xmm15",
+            "sub rdx, {NB}",
+            "jmp 3f",
+            ".p2align 5",
+            "2:",
+            "vmovdqu ymm0, ymmword ptr [rdi]",
+            "vpcmpeqb ymm1, ymm0, ymm14",
+            "vpmovmskb eax, ymm1",
+            "tzcnt eax, eax",
+            "vpcmpeqb ymm2, ymm0, ymm15",
+            "vpmovmskb ecx, ymm2",
+            "tzcnt ecx, ecx",
+            "imul r9d, eax, 2048",
+            "shl ecx, 7",
+            "add r9d, ecx",
+            "mov r10, qword ptr [{LKP} + r9 + 64]",
+            "test r10, r10",
+            "js 8f",
+            "vpxor ymm1, ymm0, ymmword ptr [{LKP} + r9]",
+            "vptest ymm1, ymmword ptr [{LKP} + r9 + 32]",
+            "jnz 8f",
+            "mov r11, qword ptr [{LKP} + r9 + 72]",
+            "mov r10, qword ptr [rdi + r10]",
+            "mov r11, qword ptr [rdi + r11]",
+            "mov qword ptr [rsi + rdx*8 + {LA} + 8*{NB}], r10",
+            "mov qword ptr [rsi + rdx*8 + {LBB} + 8*{NB}], r11",
+            "vmovdqu xmm3, xmmword ptr [{LKP} + r9 + 80]",
+            "vmovq qword ptr [rsi + rdx*8 + {LNA} + 8*{NB}], xmm3",
+            "vmovhps qword ptr [rsi + rdx*8 + {LNB} + 8*{NB}], xmm3",
+            "mov qword ptr [rsi + rdx*8 + {LAT} + 8*{NB}], rdi",
+            "lea rdi, [rdi + rax + 1]",
+            "add rdx, 1",
+            "jz 7f",
+            "3:",
+            "cmp rdi, r8",
+            "jbe 2b",
+            "xor eax, eax",
+            "jmp 6f",
+            "7:",
+            "mov eax, 2",
+            "jmp 6f",
+            "8:",
+            "mov eax, 1",
+            "6:",
+            "add rdx, {NB}",
+            "vzeroupper",
+            inout("rdi") p => np,
+            in("rsi") lb,
+            inout("rdx") n => nn,
+            in("r8") lim,
+            out("rax") code,
+            out("rcx") _, out("r9") _, out("r10") _, out("r11") _,
+            out("ymm0") _, out("ymm1") _, out("ymm2") _, out("ymm3") _, out("ymm14") _, out("ymm15") _,
+            LKP = sym LKP, NB = const NB,
+            LA = const std::mem::offset_of!(LkBatch, a), LBB = const std::mem::offset_of!(LkBatch, b),
+            LNA = const std::mem::offset_of!(LkBatch, na), LNB = const std::mem::offset_of!(LkBatch, nb),
+            LAT = const std::mem::offset_of!(LkBatch, at),
+            options(nostack),
+        );
+    }
+    (code, np, nn)
+}
+
 fn links_chunk(c: &mut Ctx, buf: &[u8]) {
-    use std::arch::x86_64::*;
-    const LB: usize = 8192;
     let len = buf.len();
     let base = buf.as_ptr();
-    let mut ends = [0u32; LB + 64];
     let mut lb: LkBatch = unsafe { std::mem::zeroed() };
     let mut nb = 0usize;
     let mut pos = 0usize;
-    let mut off = 0usize;
-    while off < len {
-        let stop = (off + LB).min(len);
-        let mut k = 0usize;
-        let mut o = off;
-        while o < stop {
-            let mut m = unsafe { eq64(base.add(o), b'\n') };
-            if stop - o < 64 {
-                m = unsafe { _bzhi_u64(m, (stop - o) as u32) };
+    if len >= LK_REACH {
+        let lim = unsafe { base.add(len - LK_REACH) };
+        loop {
+            let (code, np, n2) = unsafe { lk_loop(base.add(pos), lim, &mut lb, nb) };
+            pos = np as usize - base as usize;
+            nb = n2;
+            if code == 2 {
+                lk_batch(c, buf, &mut lb, NB);
+                nb = 0;
+            } else if code == 1 {
+                let Some(i) = buf[pos..].iter().position(|&b| b == b'\n') else { break };
+                link_slow(c, buf, pos, pos + i);
+                pos += i + 1;
+            } else {
+                break;
             }
-            while m != 0 {
-                ends[k] = (o + m.trailing_zeros() as usize) as u32;
-                k += 1;
-                m &= m - 1;
-            }
-            o += 64;
         }
-        for &e in &ends[..k] {
-            let e = e as usize;
-            if pos + 64 <= len {
-                if let Some((wa, na, wb, nbb)) = unsafe { link_pre(base.add(pos), e - pos) } {
-                    lb.a[nb] = wa;
-                    lb.b[nb] = wb;
-                    lb.na[nb] = na as u64;
-                    lb.nb[nb] = nbb as u64;
-                    lb.at[nb] = (pos as u32, e as u32);
-                    pos = e + 1;
-                    nb += 1;
-                    if nb == NB {
-                        lk_batch(c, buf, &mut lb, nb);
-                        nb = 0;
-                    }
-                    continue;
-                }
-            }
-            link_slow(c, buf, pos, e);
-            pos = e + 1;
-        }
-        off = stop;
     }
     lk_batch(c, buf, &mut lb, nb);
-    if pos < len {
-        link_slow(c, buf, pos, len);
+    while pos < len {
+        match buf[pos..].iter().position(|&b| b == b'\n') {
+            Some(i) => {
+                link_slow(c, buf, pos, pos + i);
+                pos += i + 1;
+            }
+            None => {
+                link_slow(c, buf, pos, len);
+                break;
+            }
+        }
     }
 }
 
@@ -990,7 +1108,7 @@ struct LkBatch {
     b: [u64; NB],
     na: [u64; NB],
     nb: [u64; NB],
-    at: [(u32, u32); NB],
+    at: [u64; NB],
 }
 
 #[inline(never)]
@@ -1062,7 +1180,9 @@ fn lk_batch(c: &mut Ctx, buf: &[u8], lb: &mut LkBatch, n: usize) {
     while slow != 0 {
         let i = slow.trailing_zeros() as usize;
         slow &= slow - 1;
-        link_slow(c, buf, lb.at[i].0 as usize, lb.at[i].1 as usize);
+        let s = lb.at[i] as usize - buf.as_ptr() as usize;
+        let e = s + buf[s..].iter().position(|&b| b == b'\n').unwrap();
+        link_slow(c, buf, s, e);
     }
     while genb != 0 {
         let i = genb.trailing_zeros() as usize;
@@ -1171,6 +1291,109 @@ mod tests {
             }
         }
         assert!(fast > 100_000, "{fast}");
+    }
+
+    #[test]
+    fn lk_loop_matches_link_pre() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = |m: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % m
+        };
+        let alpha = b"0123456789abcdefghijklmnopqrstuvwxyzU\"\", u_\r0\n";
+        let (mut fast, mut total) = (0usize, 0usize);
+        for _round in 0..3000 {
+            let mut buf = Vec::new();
+            let nlines = 1 + rnd(400) as usize;
+            for _ in 0..nlines {
+                for side in 0..2 {
+                    if side == 1 && rnd(60) != 0 {
+                        buf.push(b',');
+                    }
+                    let q = rnd(4) == 0;
+                    if q {
+                        buf.push(b'"');
+                    }
+                    if rnd(30) != 0 {
+                        buf.push(b'u');
+                    }
+                    let k = if rnd(8) == 0 { rnd(14) } else { 6 + rnd(3) };
+                    for _ in 0..k {
+                        let c = if rnd(25) == 0 { alpha[rnd(alpha.len() as u64) as usize] } else { alpha[rnd(36) as usize] };
+                        buf.push(c);
+                    }
+                    if q && rnd(15) != 0 {
+                        buf.push(b'"');
+                    }
+                }
+                if rnd(80) == 0 {
+                    buf.push(b',');
+                }
+                if rnd(100) == 0 {
+                    for _ in 0..rnd(40) {
+                        buf.push(b'a' + rnd(26) as u8);
+                    }
+                }
+                buf.push(b'\n');
+            }
+            let len = buf.len();
+            let mut starts = vec![0usize];
+            for (i, &c) in buf.iter().enumerate() {
+                if c == b'\n' && i + 1 < len {
+                    starts.push(i + 1);
+                }
+            }
+            if len < LK_REACH {
+                continue;
+            }
+            let base = buf.as_ptr();
+            let lim = unsafe { base.add(len - LK_REACH) };
+            let mut lb: LkBatch = unsafe { std::mem::zeroed() };
+            let mut pos = 0usize;
+            let mut k = 0usize;
+            let mut nb = 0usize;
+            loop {
+                let n0 = nb;
+                let (code, np, n2) = unsafe { lk_loop(base.add(pos), lim, &mut lb, nb) };
+                for i in n0..n2 {
+                    let s = lb.at[i] as usize - base as usize;
+                    assert_eq!(s, starts[k], "line start");
+                    let e = s + buf[s..].iter().position(|&b| b == b'\n').unwrap();
+                    let want = unsafe { link_pre(base.add(s), e - s) };
+                    let both = crate::keyrec::base36_word(lb.a[i], lb.na[i] as u32).1 && crate::keyrec::base36_word(lb.b[i], lb.nb[i] as u32).1;
+                    assert!((1..=8).contains(&lb.na[i]) && (1..=8).contains(&lb.nb[i]));
+                    if both || want.is_some() {
+                        assert_eq!(want, Some((lb.a[i], lb.na[i] as u32, lb.b[i], lb.nb[i] as u32)), "{:?}", String::from_utf8_lossy(&buf[s..e]));
+                    }
+                    assert!(s + LK_REACH <= len);
+                    k += 1;
+                    fast += 1;
+                }
+                pos = np as usize - base as usize;
+                nb = n2;
+                if k < starts.len() {
+                    assert_eq!(pos, starts[k], "next line");
+                } else {
+                    assert_eq!(pos, len);
+                }
+                if code == 2 {
+                    assert_eq!(nb, NB);
+                    nb = 0;
+                } else if code == 1 {
+                    assert!(pos + LK_REACH <= len);
+                    let i = buf[pos..].iter().position(|&b| b == b'\n').unwrap();
+                    pos += i + 1;
+                    k += 1;
+                } else {
+                    assert!(pos + LK_REACH > len);
+                    break;
+                }
+            }
+            total += starts.len();
+        }
+        assert!(fast * 2 > total, "{fast} of {total}");
     }
 
     #[test]
@@ -1581,9 +1804,48 @@ const PIN_DEFAULT: usize = env_u32(option_env!("XL_PIN_DEF"), 2) as usize;
 const QORD_DEFAULT: usize = env_u32(option_env!("XL_QORD_DEF"), 2) as usize;
 const CH_DEFAULT: usize = env_u32(option_env!("XL_CH_DEF"), 8192) as usize;
 
+pub static RD_AUTO: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const RD_AUTO_BYTES: usize = 128 << 10;
+
+pub(crate) fn fault_around_check(region: *const u8, files: &[FileInfo]) {
+    if !crate::sys::FD_ALL.load(Ordering::Relaxed) || drv().rd > 0 {
+        return;
+    }
+    match std::env::var("XL_FA").ok().as_deref() {
+        Some("1") => return,
+        Some("0") => {
+            RD_AUTO.store(RD_AUTO_BYTES, Ordering::Relaxed);
+            return;
+        }
+        _ => {}
+    }
+    let Some(f) = files.iter().max_by_key(|f| f.len) else { return };
+    if f.len < (4 << 20) {
+        return;
+    }
+    let mut own = 0;
+    for off in [f.len / 2, f.len / 4 * 3] {
+        let off = off & !0xFFFF;
+        unsafe {
+            let p = region.add(f.off + off);
+            std::ptr::read_volatile(p);
+            let a = crate::sys::minflt(1);
+            std::ptr::read_volatile(p.add(4096));
+            own += (crate::sys::minflt(1) > a) as usize;
+        }
+    }
+    if own == 2 {
+        RD_AUTO.store(RD_AUTO_BYTES, Ordering::Relaxed);
+    }
+}
+
 pub static mut FDS: Vec<i32> = Vec::new();
 #[allow(static_mut_refs)]
 pub unsafe fn keep_fd(f: std::fs::File) {
+    if crate::sys::FD_ALL.load(Ordering::Relaxed) && FDS.len() < FD_ALL_MAX {
+        FDS.push(std::os::fd::IntoRawFd::into_raw_fd(f));
+        return;
+    }
     if drv().rd > 0 {
         if FDS.iter().filter(|&&x| x >= 0).count() < KEEP_FDS {
             FDS.push(std::os::fd::IntoRawFd::into_raw_fd(f));
@@ -1593,13 +1855,14 @@ pub unsafe fn keep_fd(f: std::fs::File) {
     FDS.push(-1);
 }
 const KEEP_FDS: usize = 40;
+const FD_ALL_MAX: usize = 900;
 #[allow(static_mut_refs)]
 pub unsafe fn fds_init(n: usize) {
     FDS = vec![-1; n];
 }
 #[allow(static_mut_refs)]
 pub unsafe fn set_fd(i: usize, f: std::fs::File) {
-    if drv().rd > 0 && i < KEEP_FDS {
+    if (crate::sys::FD_ALL.load(Ordering::Relaxed) && i < FD_ALL_MAX) || (drv().rd > 0 && i < KEEP_FDS) {
         *FDS.as_mut_ptr().add(i) = std::os::fd::IntoRawFd::into_raw_fd(f);
     }
 }
@@ -1665,12 +1928,54 @@ pub(crate) fn cpu_order() -> &'static Vec<usize> {
     })
 }
 
-fn work_queue(g: &G) -> &'static (Vec<Chunk>, usize) {
-    static Q: std::sync::OnceLock<(Vec<Chunk>, usize)> = std::sync::OnceLock::new();
+// The final worker to finish a group retires the group's input mappings in one
+// syscall. A worker may already have started the next group on the same file,
+// so release only full pages inside the nominal boundaries.
+struct InputReleaseGroup {
+    remaining: std::sync::atomic::AtomicUsize,
+    start: usize,
+    end: usize,
+}
+struct InputQueue {
+    chunks: Vec<Chunk>,
+    click_link_chunks: usize,
+    group_for_chunk: Vec<usize>,
+    groups: Vec<InputReleaseGroup>,
+}
+impl InputQueue {
+    fn release(&self, index: usize, region: *const u8) {
+        let group = &self.groups[self.group_for_chunk[index]];
+        if group.remaining.fetch_sub(1, Ordering::AcqRel) == 1 && group.end > group.start {
+            unsafe { madvise(region.add(group.start) as *mut u8, group.end - group.start, MADV_DONTNEED) };
+        }
+    }
+}
+fn work_queue(g: &G) -> &'static InputQueue {
+    static Q: std::sync::OnceLock<InputQueue> = std::sync::OnceLock::new();
     Q.get_or_init(|| {
-        let v = work_queue_build(g);
-        let n = v.iter().rposition(|c| g.files[c.file as usize].kind != Kind::Ev).map_or(0, |i| i + 1);
-        (v, n)
+        let chunks = work_queue_build(g);
+        let click_link_chunks = chunks.iter().rposition(|c| g.files[c.file as usize].kind != Kind::Ev).map_or(0, |i| i + 1);
+        let mut group_for_chunk = Vec::with_capacity(chunks.len());
+        let mut groups = Vec::new();
+        let mut first = 0;
+        while first < chunks.len() {
+            let c = chunks[first];
+            let file = &g.files[c.file as usize];
+            let mut end = first + 1;
+            while end < chunks.len() && chunks[end].file == c.file
+                && chunks[end].a == chunks[end - 1].b && chunks[end].b - c.a <= (32 << 20)
+            {
+                end += 1;
+            }
+            group_for_chunk.resize(end, groups.len());
+            groups.push(InputReleaseGroup {
+                remaining: std::sync::atomic::AtomicUsize::new(end - first),
+                start: (file.off + c.a + 4095) & !4095,
+                end: (file.off + chunks[end - 1].b) & !4095,
+            });
+            first = end;
+        }
+        InputQueue { chunks, click_link_chunks, group_for_chunk, groups }
     })
 }
 fn work_queue_build(g: &G) -> Vec<Chunk> {
@@ -1810,8 +2115,13 @@ pub fn stage1(g: &G, tid: usize) {
     #[cfg(feature = "tl")]
     crate::sys::tl::mark(tid, 6);
     let t = g.t(tid);
-    t.ev = Part::new(&g.ev_arena, g.nb);
-    t.us = Part::new(&g.us_arena, g.nub);
+    if PARTS_READY.load(Ordering::Relaxed) {
+        t.ev.set_arena(&g.ev_arena);
+        t.us.set_arena(&g.us_arena);
+    } else {
+        t.ev = Part::new(&g.ev_arena, g.nb);
+        t.us = Part::new(&g.us_arena, g.nub);
+    }
     #[cfg(feature = "tl")]
     crate::sys::tl::mark(tid, 7);
     if !CORE_READY.load(Ordering::Relaxed) {
@@ -1825,13 +2135,14 @@ pub fn stage1(g: &G, tid: usize) {
     let tb = tabs(g);
     #[cfg(feature = "tl")]
     crate::sys::tl::mark(tid, 9);
-    let rd = d.rd;
+    let rd = if d.rd > 0 { d.rd } else { RD_AUTO.load(Ordering::Relaxed) };
     #[allow(static_mut_refs)]
     let fds: &[i32] = unsafe { &FDS };
     let use_rd = rd > 0 && fds.len() == g.files.len() && unsafe { SKIP } & 512 == 0;
     let rb = if use_rd { unsafe { anon(rd + 8192).add(4096) } } else { std::ptr::null_mut() };
-    let (q, nckl) = work_queue(g);
-    let nckl = *nckl;
+    let queue = work_queue(g);
+    let q = &queue.chunks;
+    let nckl = queue.click_link_chunks;
     let inq = d.st2q;
     let mut us_open = true;
     let mut sc = crate::links::Scratch::default();
@@ -1878,6 +2189,7 @@ pub fn stage1(g: &G, tid: usize) {
         let s = if c.a == f.hdr { c.a } else { next_line_start(data, c.a - 1) };
         let e = if c.b >= f.len { f.len } else { next_line_start(data, c.b - 1) };
         if s >= e {
+            if unsafe { RELEASE } { queue.release(i, g.region); }
             continue;
         }
         let buf = &data[s..e];
@@ -1893,11 +2205,7 @@ pub fn stage1(g: &G, tid: usize) {
             parse_buf(g, &mut *t, &mut eb, &mut cb, &mut out, tb, tid, f, buf, s);
         }
         if unsafe { RELEASE } {
-            let a = (f.off + s + 4095) & !4095;
-            let b = (f.off + e) & !4095;
-            if b > a {
-                unsafe { madvise(g.region.add(a) as *mut u8, b - a, MADV_DONTNEED) };
-            }
+            queue.release(i, g.region);
         }
     }
     #[cfg(feature = "tl")]

@@ -471,8 +471,10 @@ unsafe fn digest_put(tid: usize, fx: &mut Fast, d: &DigRun, q: *const u64, sidx:
     let (p, mut seg) = ed.seg(tid, d.user, words);
     seg.len = words as u32 | DIG;
     *p = ns as u64 | ((pb - pa) as u64) << 32;
-    *p.add(1) = (d.e - d.a) as u64 | (1u64 << ((*q.add(d.a) >> 32) & 15)) << 32;
-    *p.add(2) = (*q.add(d.e - 1) & 0xFFFF_FFFF) | (*q.add(d.a) & 0xFFFF_FFFF) << 32;
+    let session_ua = q as *const u32;
+    let before: *const u32 = at(q as *const u8, OQ_PREV_TS);
+    *p.add(1) = (d.e - d.a) as u64 | (1u64 << (*session_ua.add(d.s0) & 15)) << 32;
+    *p.add(2) = *before.add(d.s1) as u64 | (*sts.add(d.s0) as u64) << 32;
     let mut total = 0usize;
     for i in 0..ns {
         let s = d.s0 + i;
@@ -482,7 +484,7 @@ unsafe fn digest_put(tid: usize, fx: &mut Fast, d: &DigRun, q: *const u64, sidx:
         }
         total += rb - ra;
         *p.add(3 + 2 * i) = *sts.add(s) as u64 | ((rb - ra) as u64) << 32;
-        *p.add(4 + 2 * i) = *q.add(rb - 1) & 0xFFFF_FFFF;
+        *p.add(4 + 2 * i) = *before.add(s + 1) as u64;
     }
     if total != d.e - d.a || (*sidx.add(d.s0) & M31) as usize != d.a {
         fallback("digest sessions");
@@ -646,7 +648,10 @@ const M31: u32 = 0x7FFF_FFFF;
 const FLAG: u32 = 0x8000_0000;
 const NONE: u32 = u32::MAX;
 const GUARD: usize = 16;
-const DIV_M: u64 = 6_515_625;
+// 86,400,000 ms = 1024 * 84,375. After the right shift the dividend
+// fits exactly in binary32. This reciprocal rounds upward. Over all 22-bit
+// dividends the product error stays below 1/84,375, including final rounding.
+const DAY_RECIP: f32 = f32::from_bits(0x3746_d751);
 
 
 const XP: bool = option_env!("XL_XPROF").is_some();
@@ -1012,7 +1017,7 @@ fn name_selftest(g: &G) {
         }
     }
     for y in 0..(1u64 << 22) {
-        if (y * DIV_M) >> 39 != y / 84_375 {
+        if (y as f32 * DAY_RECIP) as u64 != y / 84_375 {
             eprintln!("[v2b] CHECK FAILED: day division at {y}");
             unsafe { crate::sys::_exit(5) }
         }
@@ -1023,6 +1028,9 @@ const FN_: usize = BSIZE + GUARD + 64;
 const fn r64c(x: usize) -> usize {
     (x + 63) & !63
 }
+// The old packed-event workspace now holds two columns indexed by session.
+const OQ_PREV_TS: usize = r64c(4 * FN_);
+const _: () = assert!(2 * OQ_PREV_TS == r64c(8 * FN_));
 const OQ_SIDX: usize = r64c(8 * FN_);
 const OQ_STS: usize = OQ_SIDX + r64c(4 * FN_);
 const OQ_SDAY: usize = OQ_STS + r64c(4 * FN_) + 4 * GUARD;
@@ -1438,94 +1446,75 @@ unsafe fn mul32_256(a: __m256i, b: __m256i) -> __m256i {
     o
 }
 
-#[inline(never)]
-unsafe fn pass_b(q: *const u64, k: usize, utab: *const u16, blkk: *const u16, mix: &mut Vec<u32>) -> usize {
-    let mut st = PassB { tlast: _mm512_setzero_si512(), ulast: _mm512_set1_epi32(0x4000_0000), carry: 0, cur: 0, ns: 0, nmix: 0 };
-    mix.clear();
-    mix.reserve(k + 1);
-    let mp = mix.as_mut_ptr();
-    let mut i = 0usize;
-    while i + 16 <= k {
-        pass_b_step(&mut st, q, i, 0xFFFF, utab, blkk as *const u8, mp);
-        i += 16;
-    }
-    if i < k {
-        pass_b_step(&mut st, q, i, (1u32 << (k - i)) - 1, utab, blkk as *const u8, mp);
-    }
-    *mp.add(st.nmix) = u32::MAX;
-    mix.set_len(st.nmix + 1);
-    st.ns
-}
-
-struct PassB {
-    tlast: __m512i,
-    ulast: __m512i,
-    carry: u32,
-    cur: u32,
+struct SessionScan {
+    previous_ts: __m512i,
+    previous_ua: __m512i,
     ns: usize,
     nmix: usize,
 }
 
+// Visit 16 physical ID locations. Keep masks translate between physical
+// locations for purchase attribution and dense event ordinals for edge runs.
 #[inline(always)]
-unsafe fn pass_b_step(st: &mut PassB, q: *const u64, i: usize, tail: u32, utab: *const u16, bb: *const u8, mix: *mut u32) {
-    let iota16 = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
-    let even32 = _mm512_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30);
-    let odd32 = _mm512_setr_epi32(1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31);
-    let gapv = _mm512_set1_epi32(GAP_MS as i32);
-    let c15 = _mm512_set1_epi32(15);
-    let userm = _mm512_set1_epi32(0x7FFF_FFF0);
-    let one = _mm512_set1_epi32(1);
-    let maskc = _mm512_set1_epi32(MASK as i32);
-    let flagv = _mm512_set1_epi32(FLAG as i32);
-    let qb = q as *const u8;
-    let sidx: *mut u32 = at(qb, OQ_SIDX);
-    let sts: *mut u32 = at(qb, OQ_STS);
+unsafe fn scan_packet(st: &mut SessionScan, qb: *const u8, bb: *const u8,
+    block: usize, event_base: usize, keep: u16, ts: __m512i, ua: __m512i,
+    utab: *const u16, mix: *mut u32) {
     let blk_ns: *mut u32 = at(bb, OB_BLKNS);
     let ssb: *mut u16 = at(bb, OB_SSB);
-    let ns = st.ns;
-    let q0 = _mm512_loadu_si512(q.add(i) as *const _);
-    let q1 = _mm512_loadu_si512(q.add(i + 8) as *const _);
-    let tv = _mm512_permutex2var_epi32(q0, even32, q1);
-    let uv = _mm512_permutex2var_epi32(q0, odd32, q1);
-    let tpv = _mm512_alignr_epi32::<15>(tv, st.tlast);
-    let upv = _mm512_alignr_epi32::<15>(uv, st.ulast);
-    st.tlast = tv;
-    st.ulast = uv;
-    let x = _mm512_xor_si512(uv, upv);
-    let rs = _mm512_test_epi32_mask(x, userm) as u32 & tail;
-    let acm = _mm512_test_epi32_mask(x, c15) as u32;
-    let gap = _mm512_cmpgt_epu32_mask(_mm512_sub_epi32(tv, tpv), gapv) as u32;
-    let ss = (rs | gap) & tail;
-    let un = _mm512_cmplt_epu32_mask(tv, tpv) as u32 & !rs;
-    let mut ut = _mm512_set1_epi32(st.cur as i32);
-    let mut m = rs;
-    while m != 0 {
-        let p = m.trailing_zeros();
-        m &= m - 1;
-        st.cur = *utab.add((*q.add(i + p as usize) >> 36) as usize) as u32;
-        ut = _mm512_mask_mov_epi32(ut, (0xFFFFu32 << p) as u16, _mm512_set1_epi32(st.cur as i32));
+    *blk_ns.add(block) = st.ns as u32;
+    if keep == 0 {
+        *ssb.add(block) = 0;
+        return;
     }
-    let abit = _mm512_sllv_epi32(one, _mm512_and_si512(uv, c15));
-    let bad = _mm512_test_epi32_mask(abit, _mm512_andnot_si512(ut, maskc)) as u32;
-    let ac = acm & !rs;
-    let badp = ((bad << 1) | st.carry) & 0xFFFF;
-    st.carry = (bad >> 15) & 1;
-    let special = (un | (ac & (bad | badp))) & tail;
-    if special != 0 {
-        let mut m = special;
-        while m != 0 {
-            *mix.add(st.nmix) = (i + m.trailing_zeros() as usize) as u32;
-            st.nmix += 1;
-            m &= m - 1;
-        }
+    let ts = _mm512_maskz_compress_epi32(keep, ts);
+    let ua = _mm512_maskz_compress_epi32(keep, ua);
+    let prev_ts = _mm512_alignr_epi32::<15>(ts, st.previous_ts);
+    let prev_ua = _mm512_alignr_epi32::<15>(ua, st.previous_ua);
+    let width = keep.count_ones();
+    let last = _mm512_set1_epi32(width as i32 - 1);
+    st.previous_ts = _mm512_permutexvar_epi32(last, ts);
+    st.previous_ua = _mm512_permutexvar_epi32(last, ua);
+    let valid = ((1u32 << width) - 1) as u16;
+    let delta = _mm512_xor_si512(ua, prev_ua);
+    let run = _mm512_test_epi32_mask(delta, _mm512_set1_epi32(0x7fff_fff0)) & valid;
+    let gap = _mm512_cmpgt_epu32_mask(_mm512_sub_epi32(ts, prev_ts), _mm512_set1_epi32(GAP_MS as i32));
+    let start = run | (gap & valid);
+    let c15 = _mm512_set1_epi32(15);
+    let changed = _mm512_test_epi32_mask(delta, c15) & !run & valid;
+    let mut special = _mm512_cmplt_epu32_mask(ts, prev_ts) & !run & valid;
+    if changed != 0 {
+        let union = if run & !1 == 0 {
+            let user = _mm_cvtsi128_si32(_mm512_castsi512_si128(ua)) as u32 >> 4;
+            _mm512_set1_epi32(*utab.add(user as usize) as i32)
+        } else {
+            let pairs = _mm512_mask_i32gather_epi32::<4>(_mm512_setzero_si512(), changed,
+                _mm512_srli_epi32::<5>(ua), utab as *const i32);
+            _mm512_srlv_epi32(pairs, _mm512_and_si512(ua, _mm512_set1_epi32(16)))
+        };
+        let one = _mm512_set1_epi32(1);
+        let current = _mm512_sllv_epi32(one, _mm512_and_si512(ua, c15));
+        let previous = _mm512_sllv_epi32(one, _mm512_and_si512(prev_ua, c15));
+        let missing = _mm512_andnot_si512(union, _mm512_set1_epi32(MASK as i32));
+        special |= changed & _mm512_test_epi32_mask(_mm512_or_si512(current, previous), missing);
     }
-    let base = _mm512_add_epi32(_mm512_set1_epi32(i as i32), iota16);
-    let idxf = _mm512_mask_or_epi32(base, rs as u16, base, flagv);
-    _mm512_storeu_si512(sidx.add(ns) as *mut _, _mm512_maskz_compress_epi32(ss as u16, idxf));
-    _mm512_storeu_si512(sts.add(ns) as *mut _, _mm512_maskz_compress_epi32(ss as u16, tv));
-    *blk_ns.add(i >> 4) = ns as u32;
-    *ssb.add(i >> 4) = ss as u16;
-    st.ns = ns + ss.count_ones() as usize;
+    while special != 0 {
+        *mix.add(st.nmix) = event_base as u32 + special.trailing_zeros();
+        st.nmix += 1;
+        special &= special - 1;
+    }
+    *ssb.add(block) = _pdep_u32(start as u32, keep as u32) as u16;
+    let iota = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    let idx = _mm512_add_epi32(_mm512_set1_epi32(event_base as i32), iota);
+    let flagged = _mm512_mask_or_epi32(idx, run, idx, _mm512_set1_epi32(FLAG as i32));
+    let sidx: *mut u32 = at(qb, OQ_SIDX);
+    let sts: *mut u32 = at(qb, OQ_STS);
+    let before: *mut u32 = at(qb, OQ_PREV_TS);
+    let su = qb as *mut u32;
+    _mm512_storeu_si512(sidx.add(st.ns) as *mut _, _mm512_maskz_compress_epi32(start, flagged));
+    _mm512_storeu_si512(sts.add(st.ns) as *mut _, _mm512_maskz_compress_epi32(start, ts));
+    _mm512_storeu_si512(before.add(st.ns) as *mut _, _mm512_maskz_compress_epi32(start, prev_ts));
+    _mm512_storeu_si512(su.add(st.ns) as *mut _, _mm512_maskz_compress_epi32(start, ua));
+    st.ns += start.count_ones() as usize;
 }
 
 #[inline(never)]
@@ -1533,14 +1522,12 @@ unsafe fn purch_scan(q: *const u64, blkk: *const u16, pl: *const u16, aggp: *con
     let (qb, bb, pb) = (q as *const u8, blkk as *const u8, pl as *const u8);
     let slots = qb.wrapping_sub(OQ_SLOTS) as *const Rec;
     let (scamp, sday): (*const u32, *const u32) = (at(qb, OQ_SCAMP), at(qb, OQ_SDAY));
-    let keepm: *const u8 = at(bb, OB_KEEPM);
     let (blk_ns, ssb, blk_nrow, rwb): (*const u32, *const u16, *const u32, *const u16) = (at(bb, OB_BLKNS), at(bb, OB_SSB), at(bb, OB_BLKNROW), at(bb, OB_RWB));
     let (pc, ps, pr, pw): (*mut u32, *mut u32, *mut u32, *mut u32) = (at(pb, OP_CELL), at(pb, OP_SID), at(pb, OP_ROW), at(pb, OP_W));
     for j in 0..np {
         let sl = *pl.add(j) as usize;
         let wv = (*slots.add(sl)).w0;
-        let i = *blkk.add(sl >> 3) as usize + _bzhi_u32(*keepm.add(sl >> 3) as u32, sl as u32 & 7).count_ones() as usize;
-        let sid = (*blk_ns.add(i >> 4) + _bzhi_u32(*ssb.add(i >> 4) as u32, (i as u32 & 15) + 1).count_ones() - 1) as usize;
+        let sid = (*blk_ns.add(sl >> 4) + _bzhi_u32(*ssb.add(sl >> 4) as u32, (sl as u32 & 15) + 1).count_ones() - 1) as usize;
         let cell = *scamp.add(sid) as usize * nd + *sday.add(sid) as usize;
         let row = *blk_nrow.add(sid >> 4) + _bzhi_u32(*rwb.add(sid >> 4) as u32, (sid as u32 & 15) + 1).count_ones() - 1;
         _mm_prefetch::<_MM_HINT_T0>(aggp.add(cell) as *const i8);
@@ -1598,15 +1585,14 @@ struct Walk {
 #[inline(never)]
 unsafe fn walk_runs(fx: &mut Fast, g: &G, wk: &mut Walk, xp: &mut Xp, r0: usize, nrun: usize, pidx0: u32, org: u32) -> usize {
     let (qb, pb, rcb) = (fx.q as *const u8, fx.plist as *const u8, fx.rc as *const u8);
-    let q = fx.q as *const u64;
-    let (sidx, scamp): (*const u32, *mut u32) = (at(qb, OQ_SIDX), at(qb, OQ_SCAMP));
+    let su = fx.q as *const u32;
+    let sidx: *const u32 = at(qb, OQ_SIDX);
     let (run_s0, run_pidx) = (pb.wrapping_sub(OP_RUNS0) as *const u32, pb.wrapping_sub(OP_RUNPIDX) as *mut u32);
     let (nm_v, nm_r, nm_best): (*mut u64, *mut u32, *mut u64) = (at(pb, OP_NMV), at(pb, OP_NMR), at(pb, OP_NMBEST));
     let (wl_s0, wl_r0): (*mut u32, *mut u32) = (at(rcb, OR_WLS), at(rcb, OR_WLR));
     let mixv = fx.mix.as_ptr();
     let ev_idx = _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14);
     let iota16 = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
-    let orgv = _mm512_set1_epi32(org as i32);
     let (mut cw, mut cb) = (wk.cw, wk.cb);
     let (mut nw, mut nrc) = (wk.nw, wk.nrc);
     let (mut nm_np, mut nm_na) = (wk.nm_np, wk.nm_na);
@@ -1618,8 +1604,8 @@ unsafe fn walk_runs(fx: &mut Fast, g: &G, wk: &mut Walk, xp: &mut Xp, r0: usize,
         let s1 = *run_s0.add(r + 1) as usize;
         let a = (*sidx.add(s0) & M31) as usize;
         let e = (*sidx.add(s1) & M31) as usize;
-        let qa = *q.add(a);
-        let u = (qa >> 36) as u32;
+        let ua = *su.add(s0);
+        let u = ua >> 4;
         let tv = *g.utab.add(u as usize);
         while (*mixv.add(mixp) as usize) < a {
             mixp += 1;
@@ -1642,7 +1628,7 @@ unsafe fn walk_runs(fx: &mut Fast, g: &G, wk: &mut Walk, xp: &mut Xp, r0: usize,
         }
         cb |= 1u64 << (u & 63);
         let mask = (tv & MASK) as u32;
-        let bit = 1u32 << ((qa >> 32) & 15);
+        let bit = 1u32 << (ua & 15);
         let class = if bit & mask != 0 { mask } else { bit };
         if XD { xp.ph(10); }
         let ncl = class.count_ones() as usize;
@@ -1659,16 +1645,26 @@ unsafe fn walk_runs(fx: &mut Fast, g: &G, wk: &mut Walk, xp: &mut Xp, r0: usize,
         nm_na += 1;
         c_sess += (s1 - s0) as u64;
         if XD { xp.ph(11); }
-        let mut x = s0;
-        while x < s1 {
-            _mm512_storeu_si512(scamp.add(x) as *mut _, orgv);
-            x += 16;
-        }
         let cks = g.csr_range(u);
         let n = cks.len();
         let nsr = s1 - s0;
         let mut light = n == 0;
-        if n != 0 && n <= 16 && nsr <= WL_RUN {
+        if n == 1 {
+            // One click can credit and assist exactly the same campaign.
+            let click = cks[0][0];
+            if class & (1 << (click & 15)) != 0 {
+                let click_ts = (click >> 32) as u32;
+                let campaign = ((click >> 4) as usize) & (CBOUND - 1);
+                let assists = fx.asst.add(campaign) as *mut u32;
+                for sid in s0..s1 {
+                    if click_ts.wrapping_sub(*fx.sts.add(sid)) <= WEEK_MS as u32 {
+                        *fx.scamp.add(sid) = campaign as u32;
+                        *assists.add(*fx.sday.add(sid) as usize) += 1;
+                    }
+                }
+            }
+            light = true;
+        } else if n != 0 && n <= 16 && nsr <= WL_RUN {
             if nrc == RC_N || nw + nsr > WL_CAP {
                 xp.ph(4);
                 light_flush(fx, nw, org);
@@ -1683,9 +1679,19 @@ unsafe fn walk_runs(fx: &mut Fast, g: &G, wk: &mut Walk, xp: &mut Xp, r0: usize,
             let ts = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(_mm512_cvtepi64_epi32(_mm512_srli_epi64(ka, 32))), _mm512_cvtepi64_epi32(_mm512_srli_epi64(kb, 32)));
             let vm = (1u32 << n) - 1;
             let inc = _mm512_test_epi32_mask(_mm512_sllv_epi32(_mm512_set1_epi32(1), _mm512_and_si512(lo32, _mm512_set1_epi32(15))), _mm512_set1_epi32(class as i32)) as u32;
-            if inc & vm == vm {
-                light = true;
-                let camp = _mm512_and_si512(lo32, _mm512_set1_epi32((CBOUND as i32 - 1) << 4));
+            let eligible = inc & vm;
+            light = true;
+            if eligible != 0 {
+                let mut camp = _mm512_and_si512(lo32, _mm512_set1_epi32((CBOUND as i32 - 1) << 4));
+                let mut ts = ts;
+                let mut vm = vm;
+                if eligible != vm {
+                    // Filtering before computing conflicts preserves click order.
+                    // Within the filtered history every winning window is contiguous.
+                    camp = _mm512_maskz_compress_epi32(eligible as u16, camp);
+                    ts = _mm512_maskz_compress_epi32(eligible as u16, ts);
+                    vm = (1u32 << eligible.count_ones()) - 1;
+                }
                 let ri = nrc;
                 nrc += 1;
                 let rcp = (rcb as *mut Rc).add(ri);
@@ -1766,10 +1772,10 @@ fn stage3a(g: &G, tid: usize, pool: &Pool, sh: &Share) {
         let (blk_nrow, rwb): (*mut u32, *mut u16) = (at(bb, OB_BLKNROW), at(bb, OB_RWB));
         let (run_s0, run_row0, run_pidx) = (pb.wrapping_sub(OP_RUNS0) as *mut u32, pb.wrapping_sub(OP_RUNROW0) as *mut u32, pb.wrapping_sub(OP_RUNPIDX) as *mut u32);
         let mut gen = 0u64;
+        let iota8q = _mm512_setr_epi64(0, 1, 2, 3, 4, 5, 6, 7);
         let dig_min = DIG_MIN.load(Ordering::Relaxed);
         let ev_idx = _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14);
         let od_idx = _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15);
-        let iota8q = _mm512_setr_epi64(0, 1, 2, 3, 4, 5, 6, 7);
         let iota16 = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
         loop {
             let b = g.next.fetch_add(1, Ordering::Relaxed);
@@ -1801,20 +1807,23 @@ fn stage3a(g: &G, tid: usize, pool: &Pool, sh: &Share) {
             let tb = std::time::Instant::now();
             xp.ph(0);
             let mut k = 0usize;
+            let mut scan = SessionScan { previous_ts: _mm512_setzero_si512(), previous_ua: _mm512_set1_epi32(0x4000_0000), ns: 0, nmix: 0 };
+            fx.mix.clear();
+            fx.mix.reserve(BSIZE + 1);
+            let mix = fx.mix.as_mut_ptr();
             {
                 let inv = _mm512_set1_epi64(INVALID_TS as i64);
-                let m16 = _mm512_set1_epi64(0xFFFF);
                 let m15 = _mm512_set1_epi64(15);
                 let pmask = _mm512_set1_epi64((0xFF_FFFFu64 << 9) as i64);
-                let eight = _mm512_set1_epi64(8);
+                let m16 = _mm512_set1_epi64(0xffff);
                 let mut tagv = _mm512_add_epi64(iota8q, _mm512_set1_epi64(gen as i64));
-                let mut step = |blk: usize, k: &mut usize, tagv: &mut __m512i| {
+                let mut step = |blk: usize, k: &mut usize| {
                     let r0 = _mm512_loadu_si512(slots.add(8 * blk) as *const _);
                     let r1 = _mm512_loadu_si512(slots.add(8 * blk + 4) as *const _);
                     let w0 = _mm512_permutex2var_epi64(r0, ev_idx, r1);
                     let w1 = _mm512_permutex2var_epi64(r0, od_idx, r1);
-                    let occ = _mm512_testn_epi64_mask(_mm512_sub_epi64(w1, *tagv), m16);
-                    *tagv = _mm512_add_epi64(*tagv, eight);
+                    let occ = _mm512_testn_epi64_mask(_mm512_sub_epi64(w1, tagv), m16);
+                    tagv = _mm512_add_epi64(tagv, _mm512_set1_epi64(8));
                     let tsq = _mm512_srli_epi64(w0, 33);
                     let valid = _mm512_mask_cmpneq_epu64_mask(occ, tsq, inv);
                     let odd = valid & _mm512_movepi64_mask(w1);
@@ -1823,18 +1832,22 @@ fn stage3a(g: &G, tid: usize, pool: &Pool, sh: &Share) {
                     }
                     let keep = valid & !odd;
                     let ua = _mm512_ternarylogic_epi64(_mm512_srli_epi64(w1, 33), w0, m15, 0xD8);
-                    let qv = _mm512_or_si512(_mm512_slli_epi64(ua, 32), tsq);
-                    _mm512_storeu_si512(q.add(*k) as *mut _, _mm512_maskz_compress_epi64(keep, qv));
                     *blkk.add(blk) = *k as u16;
                     *keepm.add(blk) = keep;
                     *pkm.add(blk) = keep & _mm512_test_epi64_mask(w0, pmask);
                     *k += keep.count_ones() as usize;
+                    (keep, _mm512_cvtepi64_epi32(tsq), _mm512_cvtepi64_epi32(ua))
                 };
                 const _: () = assert!((BSIZE / 8) % 2 == 0);
                 let mut blk = 0usize;
                 while blk < BSIZE / 8 {
-                    step(blk, &mut k, &mut tagv);
-                    step(blk + 1, &mut k, &mut tagv);
+                    let base = k;
+                    let (k0, t0, u0) = step(blk, &mut k);
+                    let (k1, t1, u1) = step(blk + 1, &mut k);
+                    let keep = k0 as u16 | (k1 as u16) << 8;
+                    let ts = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(t0), t1);
+                    let ua = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(u0), u1);
+                    scan_packet(&mut scan, qb, bb, blk >> 1, base, keep, ts, ua, g.utab, mix);
                     blk += 2;
                 }
                 *blkk.add(BSIZE / 8) = k as u16;
@@ -1846,57 +1859,52 @@ fn stage3a(g: &G, tid: usize, pool: &Pool, sh: &Share) {
                 t.prof[1] += (tc - tb).as_nanos() as u64;
                 continue;
             }
-            let ns = pass_b(q, k, g.utab, blkk, &mut fx.mix);
+            let ns = scan.ns;
+            *mix.add(scan.nmix) = u32::MAX;
+            fx.mix.set_len(scan.nmix + 1);
+            let before: *mut u32 = at(qb, OQ_PREV_TS);
+            *before.add(ns) = _mm_cvtsi128_si32(_mm512_castsi512_si128(scan.previous_ts)) as u32;
             *sidx.add(ns) = k as u32 | FLAG;
             xp.ph(2);
             let mut nrow = 0usize;
+            let mut nrun = 0usize;
             {
                 let wsm = _mm512_set1_epi32(g.ws_mod as i32);
-                let mg = _mm256_set1_epi64x(DIV_M as i64);
-                let flagv = _mm512_set1_epi32(FLAG as i32);
+                let orgv = _mm512_set1_epi32(org as i32);
+                let recip = _mm512_set1_ps(DAY_RECIP);
                 let m31v = _mm512_set1_epi32(M31 as i32);
-                *sday.sub(1) = u32::MAX;
+                let mut last_day = _mm512_set1_epi32(-1);
                 let mut s = 0usize;
                 while s < ns {
                     let rem = ns - s;
                     let tail: u32 = if rem >= 16 { 0xFFFF } else { (1u32 << rem) - 1 };
                     let x = _mm512_srli_epi32(_mm512_add_epi32(_mm512_loadu_si512(sts.add(s) as *const _), wsm), 10);
-                    let div = |v: __m256i| -> __m256i {
-                        let pe = _mm256_srli_epi64(mul32_256(v, mg), 39);
-                        let po = _mm256_srli_epi64(mul32_256(_mm256_srli_epi64(v, 32), mg), 39);
-                        _mm256_or_si256(pe, _mm256_slli_epi64(po, 32))
-                    };
-                    let day = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(div(_mm512_castsi512_si256(x))), div(_mm512_extracti64x4_epi64::<1>(x)));
+                    let day = _mm512_cvttps_epi32(_mm512_mul_ps(_mm512_cvtepi32_ps(x), recip));
                     _mm512_storeu_si512(sday.add(s) as *mut _, day);
-                    let dprev = _mm512_loadu_si512(sday.add(s).sub(1) as *const _);
+                    _mm512_storeu_si512(scamp.add(s) as *mut _, orgv);
+                    let dprev = _mm512_alignr_epi32::<15>(day, last_day);
+                    last_day = day;
                     let iv = _mm512_loadu_si512(sidx.add(s) as *const _);
-                    let rw = ((_mm512_movepi32_mask(iv) | _mm512_cmpneq_epi32_mask(day, dprev)) as u32 & tail) as u16;
+                    let run = _mm512_movepi32_mask(iv) & tail as u16;
+                    let rw = run | (_mm512_cmpneq_epi32_mask(day, dprev) & tail as u16);
                     *blk_nrow.add(s >> 4) = nrow as u32;
                     *rwb.add(s >> 4) = rw;
-                    let ord = _mm512_or_si512(_mm512_add_epi32(_mm512_set1_epi32(s as i32), iota16), _mm512_and_si512(iv, flagv));
+                    let ord = _mm512_add_epi32(_mm512_set1_epi32(s as i32), iota16);
                     _mm512_storeu_si512(row_day.add(nrow) as *mut _, _mm512_maskz_compress_epi32(rw, day));
                     _mm512_storeu_si512(row_s0.add(nrow) as *mut _, _mm512_maskz_compress_epi32(rw, ord));
                     _mm512_storeu_si512(row_r0.add(nrow) as *mut _, _mm512_maskz_compress_epi32(rw, _mm512_and_si512(iv, m31v)));
+                    // Each user start is also a day-row start. PEXT translates
+                    // its session-lane mask into the compacted row-lane mask.
+                    let run_in_rows = _pext_u32(run as u32, rw as u32) as u16;
+                    let rows = _mm512_add_epi32(_mm512_set1_epi32(nrow as i32), iota16);
+                    _mm512_storeu_si512(run_s0.add(nrun) as *mut _, _mm512_maskz_compress_epi32(run, ord));
+                    _mm512_storeu_si512(run_row0.add(nrun) as *mut _, _mm512_maskz_compress_epi32(run_in_rows, rows));
+                    nrun += run.count_ones() as usize;
                     nrow += rw.count_ones() as usize;
                     s += 16;
                 }
-                *row_s0.add(nrow) = ns as u32 | FLAG;
+                *row_s0.add(nrow) = ns as u32;
                 *row_r0.add(nrow) = k as u32;
-            }
-            let mut nrun = 0usize;
-            {
-                let m31v = _mm512_set1_epi32(M31 as i32);
-                let mut r = 0usize;
-                while r < nrow {
-                    let rem = nrow - r;
-                    let tail: u32 = if rem >= 16 { 0xFFFF } else { (1u32 << rem) - 1 };
-                    let v = _mm512_loadu_si512(row_s0.add(r) as *const _);
-                    let m = (_mm512_movepi32_mask(v) as u32 & tail) as u16;
-                    _mm512_storeu_si512(run_s0.add(nrun) as *mut _, _mm512_maskz_compress_epi32(m, _mm512_and_si512(v, m31v)));
-                    _mm512_storeu_si512(run_row0.add(nrun) as *mut _, _mm512_maskz_compress_epi32(m, _mm512_add_epi32(_mm512_set1_epi32(r as i32), iota16)));
-                    nrun += m.count_ones() as usize;
-                    r += 16;
-                }
                 *run_s0.add(nrun) = ns as u32;
                 *run_row0.add(nrun) = nrow as u32;
             }
@@ -1907,7 +1915,6 @@ fn stage3a(g: &G, tid: usize, pool: &Pool, sh: &Share) {
             let mut digs = [DigRun { first: false, user: 0, a: 0, e: 0, s0: 0, s1: 0 }; 2];
             let mut ndig = 0usize;
             let mixv = fx.mix.as_ptr();
-            let trashv = _mm512_set1_epi32(trash as i32);
             let mut r = 0usize;
             loop {
                 xp.ph(4);
@@ -1919,7 +1926,7 @@ fn stage3a(g: &G, tid: usize, pool: &Pool, sh: &Share) {
                 let s1 = *run_s0.add(r + 1) as usize;
                 let a = (*sidx.add(s0) & M31) as usize;
                 let e = (*sidx.add(s1) & M31) as usize;
-                let u = (*q.add(a) >> 36) as u32;
+                let u = *((q as *const u32).add(s0)) >> 4;
                 let tv = *g.utab.add(u as usize);
                 let special = (*mixv.add(wk.mixp) as usize) < e;
                 let edge = r == 0 || r + 1 == nrun;
@@ -1927,11 +1934,7 @@ fn stage3a(g: &G, tid: usize, pool: &Pool, sh: &Share) {
                 xc(26, (e - a) as u64);
                 xp.ph(4);
                 *run_pidx.add(r) = NONE;
-                let mut x = s0;
-                while x < s1 {
-                    _mm512_storeu_si512(scamp.add(x) as *mut _, trashv);
-                    x += 16;
-                }
+                std::slice::from_raw_parts_mut(scamp.add(s0), s1 - s0).fill(trash);
                 let dig = edge && !special && tv & COMPLEX == 0 && e - a >= dig_min && 3 + 2 * (s1 - s0) + (e - a) <= EP_WORDS;
                 if dig {
                     digs[ndig] = DigRun { first: r == 0, user: u, a, e, s0, s1 };
@@ -2027,7 +2030,6 @@ fn stage3a(g: &G, tid: usize, pool: &Pool, sh: &Share) {
                 let row_cap = row_cap.min(core.keys.cap()).min(core.day.cap()).min(core.ses.cap()).min(core.evs.cap()).min(core.rev.cap()).min(core.cat.cap());
                 let (keys, dayc, sesc, evsc, revc, catc) = (core.keys.as_mut_ptr(), core.day.as_mut_ptr(), core.ses.as_mut_ptr(), core.evs.as_mut_ptr(), core.rev.as_mut_ptr(), core.cat.as_mut_ptr());
                 let day0 = _mm512_set1_epi32(g.day0);
-                let m31v = _mm512_set1_epi32(M31 as i32);
                 let maxv = _mm512_set1_epi32(i32::MAX);
                 let mut r = 0usize;
                 while r < nrun {
@@ -2062,8 +2064,8 @@ fn stage3a(g: &G, tid: usize, pool: &Pool, sh: &Share) {
                     while x < rb {
                         let o = n + (x - ra);
                         _mm512_storeu_si512(dayc.add(o) as *mut _, _mm512_add_epi32(_mm512_loadu_si512(row_day.add(x) as *const _), day0));
-                        let sa = _mm512_and_si512(_mm512_loadu_si512(row_s0.add(x) as *const _), m31v);
-                        let sb = _mm512_and_si512(_mm512_loadu_si512(row_s0.add(x + 1) as *const _), m31v);
+                        let sa = _mm512_loadu_si512(row_s0.add(x) as *const _);
+                        let sb = _mm512_loadu_si512(row_s0.add(x + 1) as *const _);
                         _mm512_storeu_si512(sesc.add(o) as *mut _, _mm512_sub_epi32(sb, sa));
                         _mm512_storeu_si512(evsc.add(o) as *mut _, _mm512_sub_epi32(_mm512_loadu_si512(row_r0.add(x + 1) as *const _), _mm512_loadu_si512(row_r0.add(x) as *const _)));
                         let rv = _mm512_loadu_si512(row_rev.add(x) as *const _);

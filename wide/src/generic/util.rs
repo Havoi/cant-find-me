@@ -151,6 +151,44 @@ pub fn eq_mask64(p: &[u8], c: u8) -> u64 {
     m
 }
 
+/// One bit per comma, line feed or quote, in byte order.
+#[inline(always)]
+pub fn csv_mask64(input: &[u8]) -> u64 {
+    let bytes: &[u8; 64] = input[..64].try_into().unwrap();
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
+    {
+        eq_mask64(bytes, b',') | eq_mask64(bytes, b'\n') | eq_mask64(bytes, b'"')
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use std::arch::aarch64::*;
+        const BITS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+        let weights = vld1q_u8(BITS.as_ptr());
+        let markers = |offset: usize| {
+            let b = vld1q_u8(bytes.as_ptr().add(offset));
+            let comma = vceqq_u8(b, vdupq_n_u8(b','));
+            let lf = vceqq_u8(b, vdupq_n_u8(b'\n'));
+            let quote = vceqq_u8(b, vdupq_n_u8(b'"'));
+            vandq_u8(weights, vorrq_u8(vorrq_u8(comma, lf), quote))
+        };
+        let a = vpaddq_u8(markers(0), markers(16));
+        let b = vpaddq_u8(markers(32), markers(48));
+        let c = vpaddq_u8(a, b);
+        vgetq_lane_u64::<0>(vreinterpretq_u64_u8(vpaddq_u8(c, c)))
+    }
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        all(target_arch = "x86_64", target_feature = "avx512bw")
+    )))]
+    {
+        let mut mask = 0u64;
+        for (i, &b) in bytes.iter().enumerate() {
+            mask |= (matches!(b, b',' | b'\n' | b'"') as u64) << i;
+        }
+        mask
+    }
+}
+
 #[inline]
 pub fn find_byte(h: &[u8], c: u8) -> Option<usize> {
     let mut i = 0;

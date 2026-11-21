@@ -1,4 +1,4 @@
-use super::util::{count_byte, eq_mask64, find_byte, find_sub};
+use super::util::{count_byte, csv_mask64, eq_mask64, find_byte, find_sub};
 use std::io;
 
 pub type B<'a> = &'a [u8];
@@ -108,39 +108,60 @@ pub fn split<'a, const N: usize>(line: B<'a>) -> Option<[B<'a>; N]> {
     Some(out)
 }
 
+/// Tokenize a whole chunk once. Field boundaries survive SIMD block boundaries.
 #[inline]
-pub unsafe fn first_two<'a>(p: &'a u8) -> (B<'a>, B<'a>) {
-    let p0 = p as *const u8;
-    let mut q = p0;
-    while *q != b',' {
-        q = q.add(1);
+pub fn for_records<'a, const N: usize>(chunk: B<'a>, mut row: impl FnMut([B<'a>; N])) {
+    let mut fields: [B<'a>; N] = [&[]; N];
+    let mut line = 0;
+    let mut start = 0;
+    let mut column = 0;
+    let mut quotes = 0usize;
+    let mut marker = |end: usize, byte: u8| {
+        if byte == b'"' {
+            quotes += 1;
+            return;
+        }
+        if column < N {
+            let field = &chunk[start..end];
+            if quotes == 0 {
+                fields[column] = field;
+                column += 1;
+            } else if quotes == 2 && field.len() >= 2 && field[0] == b'"' && field[field.len() - 1] == b'"' {
+                fields[column] = &field[1..field.len() - 1];
+                column += 1;
+            } else {
+                column = N + 1;
+            }
+        } else {
+            column = N + 1;
+        }
+        if byte == b'\n' {
+            if column == N && end > line {
+                row(fields);
+            }
+            line = end + 1;
+            column = 0;
+        }
+        quotes = 0;
+        start = end + 1;
+    };
+    let mut base = 0;
+    while chunk.len() - base >= 64 {
+        let mut mask = csv_mask64(&chunk[base..]);
+        while mask != 0 {
+            let pos = base + mask.trailing_zeros() as usize;
+            marker(pos, chunk[pos]);
+            mask &= mask - 1;
+        }
+        base += 64;
     }
-    let f0 = std::slice::from_raw_parts(p0, q.offset_from(p0) as usize);
-    let p1 = q.add(1);
-    let mut q = p1;
-    while *q != b',' {
-        q = q.add(1);
+    for (pos, &b) in chunk.iter().enumerate().skip(base) {
+        if matches!(b, b',' | b'"' | b'\n') {
+            marker(pos, b);
+        }
     }
-    let f1 = std::slice::from_raw_parts(p1, q.offset_from(p1) as usize);
-    (strip(f0), strip(f1))
-}
-
-#[inline]
-pub unsafe fn first<'a>(p: &'a u8) -> B<'a> {
-    let p0 = p as *const u8;
-    let mut q = p0;
-    while *q != b',' {
-        q = q.add(1);
-    }
-    strip(std::slice::from_raw_parts(p0, q.offset_from(p0) as usize))
-}
-
-#[inline]
-fn strip(f: B) -> B {
-    if !f.is_empty() && f[0] == b'"' {
-        &f[1..f.len() - 1]
-    } else {
-        f
+    if !chunk.is_empty() && chunk.last() != Some(&b'\n') {
+        marker(chunk.len(), b'\n');
     }
 }
 
@@ -168,81 +189,112 @@ fn is_leap(y: i64) -> bool {
 }
 
 #[inline]
-fn civil(s: &[u8]) -> Option<i64> {
-    if s[4] != b'-' || s[7] != b'-' || s[10] != b'T' || s[13] != b':' || s[16] != b':' {
+fn midnight(s: &[u8]) -> Option<i64> {
+    if s[4] != b'-' || s[7] != b'-' {
         return None;
     }
     let y = d2(s[0], s[1])? * 100 + d2(s[2], s[3])?;
-    let mo = d2(s[5], s[6])?;
-    let d = d2(s[8], s[9])?;
-    let h = d2(s[11], s[12])?;
-    let mi = d2(s[14], s[15])?;
-    let se = d2(s[17], s[18])?;
-    if !(1..=12).contains(&mo) || h > 23 || mi > 59 || se > 59 || d < 1 {
-        return None;
-    }
-    let dim = match mo {
+    let month = d2(s[5], s[6])?;
+    let day = d2(s[8], s[9])?;
+    let limit = match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
-        _ => {
-            if is_leap(y) {
-                29
-            } else {
-                28
-            }
-        }
+        2 if is_leap(y) => 29,
+        2 => 28,
+        _ => return None,
     };
-    if d > dim {
+    if day == 0 || day > limit {
         return None;
     }
-    Some((days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + se) * 1000)
+    Some(days_from_civil(y, month, day) * DAY_MS)
 }
 
-#[inline]
-pub fn parse_ts(s: &[u8]) -> Option<i64> {
-    if s.is_empty() {
-        return None;
+#[derive(Default, Clone, Copy)]
+struct DateSlot {
+    prefix: u64,
+    day: u16,
+    midnight: i64,
+}
+
+pub struct TimestampParser {
+    days: [DateSlot; 64],
+}
+
+impl TimestampParser {
+    pub fn new() -> Self {
+        Self {
+            days: [DateSlot::default(); 64],
+        }
     }
-    if s.iter().all(|b| b.is_ascii_digit()) {
-        let mut i = 0;
-        while i < s.len() && s[i] == b'0' {
-            i += 1;
-        }
-        let r = &s[i..];
-        if r.len() > 18 {
-            return None;
-        }
-        let mut v: i64 = 0;
-        for &b in r {
-            v = v * 10 + (b - b'0') as i64;
-        }
-        return Some(v);
-    }
-    match s.len() {
-        20 => {
-            if s[19] != b'Z' {
-                return None;
-            }
-            civil(s)
-        }
-        25 => {
-            let sign = match s[19] {
-                b'+' => 1,
-                b'-' => -1,
+
+    #[inline]
+    pub fn parse(&mut self, s: &[u8]) -> Option<i64> {
+        if matches!(s.len(), 20 | 25) && s[4] == b'-' {
+            let offset = match s.len() {
+                20 if s[19] == b'Z' => 0,
+                25 if s[22] == b':' => {
+                    let hours = d2(s[20], s[21])?;
+                    let mins = d2(s[23], s[24])?;
+                    if hours > 23 || mins > 59 {
+                        return None;
+                    }
+                    let offset = (hours * 60 + mins) * 60_000;
+                    match s[19] {
+                        b'+' => offset,
+                        b'-' => -offset,
+                        _ => return None,
+                    }
+                }
                 _ => return None,
             };
-            if s[22] != b':' {
+            if s[10] != b'T' || s[13] != b':' || s[16] != b':' {
                 return None;
             }
-            let oh = d2(s[20], s[21])?;
-            let om = d2(s[23], s[24])?;
-            if oh > 23 || om > 59 {
+            let h = d2(s[11], s[12])?;
+            let m = d2(s[14], s[15])?;
+            let sec = d2(s[17], s[18])?;
+            if h > 23 || m > 59 || sec > 59 {
                 return None;
             }
-            civil(s).map(|t| t - sign * (oh * 3600 + om * 60) * 1000)
+            // Use the day digits to select a slot. Exact equality on all ten bytes
+            // makes this independent of the window, data order and date range.
+            let p = u64::from_le_bytes(s[..8].try_into().unwrap());
+            let day = u16::from_le_bytes(s[8..10].try_into().unwrap());
+            let idx = ((s[8] as usize * 11) + s[9] as usize) & 63;
+            let slot = &mut self.days[idx];
+            if slot.prefix != p || slot.day != day {
+                *slot = DateSlot {
+                    prefix: p,
+                    day,
+                    midnight: midnight(s)?,
+                };
+            }
+            Some(slot.midnight + ((h * 60 + m) * 60 + sec) * 1000 - offset)
+        } else {
+            // Values beyond the supported civil window can be dropped straight away.
+            // Skip leading zeros once so arbitrarily padded epoch values still work.
+            if s.is_empty() {
+                return None;
+            }
+            let digits = &s[s.iter().position(|&b| b != b'0').unwrap_or(s.len())..];
+            if digits.len() > 18 {
+                return None;
+            }
+            let mut value = 0i64;
+            for &b in digits {
+                let d = b.wrapping_sub(b'0');
+                if d > 9 {
+                    return None;
+                }
+                value = value * 10 + i64::from(d);
+            }
+            Some(value)
         }
-        _ => None,
     }
+}
+
+pub fn parse_ts(s: &[u8]) -> Option<i64> {
+    TimestampParser::new().parse(s)
 }
 
 #[inline]
@@ -319,13 +371,42 @@ mod tests {
         assert_eq!(split::<2>(b"a,b\""), None);
         assert_eq!(split::<2>(b"a,b,c"), None);
         assert_eq!(split::<2>(b"a"), None);
-        let l = b"\"e1\",u 1,x,y";
-        let (a, b) = unsafe { first_two(&l[0]) };
-        assert_eq!((a, b), (&b"e1"[..], &b"u 1"[..]));
-        let l = b",\"\",x";
-        let (a, b) = unsafe { first_two(&l[0]) };
-        assert_eq!((a, b), (&b""[..], &b""[..]));
     }
+    #[test]
+    fn structural_csv_matches_per_line_parser() {
+        // Shift all delimiter and quote positions through every SIMD lane.
+        // The final record has no trailing line feed.
+        let rows = b"a,b,c\n\"left\",\"\",right\n\na,b\na,b,c,d\n\"a,b,c\na\"b,c,d\n\"a\"\"\",b,c\na\r,b,c\r\n one,\" two\",last";
+        for n in 0..128 {
+            let mut bytes = vec![b'x'; n];
+            bytes.extend_from_slice(rows);
+            let mut expected = Vec::new();
+            for_lines(&bytes, |line| {
+                if let Some(fields) = split::<3>(line) {
+                    expected.push(fields);
+                }
+            });
+            let mut actual = Vec::new();
+            for_records::<3>(&bytes, |fields| actual.push(fields));
+            assert_eq!(actual, expected, "alignment {n}");
+        }
+    }
+
+    #[test]
+    fn dates_with_same_cache_index_are_verified() {
+        let mut parser = TimestampParser::new();
+        for (text, answer) in [
+            (&b"2028-02-29T00:00:00Z"[..], Some(1_835_395_200_000)),
+            (b"2027-02-29T00:00:00Z", None),
+            (b"2028-02-29T00:00:00-01:30", Some(1_835_400_600_000)),
+            (b"2028-00-29T00:00:00Z", None),
+            (b"00000000000000000000000000000000000000000000001", Some(1)),
+            (b"0000000000000000000000000000000000000000000000x", None),
+        ] {
+            assert_eq!(parser.parse(text), answer);
+        }
+    }
+
     #[test]
     fn lines() {
         let mut s = Vec::new();

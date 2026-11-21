@@ -1,4 +1,4 @@
-use super::parse::{day_of, first, first_two, for_lines, count_lines, parse_price, parse_ts, split, B, DAY_MS};
+use super::parse::{day_of, for_lines, for_records, count_lines, parse_price, TimestampParser, split, B, DAY_MS};
 use super::util::{hash, Map, Tab};
 
 
@@ -103,23 +103,16 @@ pub const T_CART: u32 = 1;
 pub const T_PURCHASE: u32 = 2;
 pub const T_INVALID: u32 = 255;
 
+/// Both decoded keys remain borrowed directly from their input mapping.
 #[derive(Clone, Copy)]
 pub struct Ev<'a> {
-    pub line: &'a u8,
+    pub eid: B<'a>,
+    pub user: B<'a>,
+    pub hash: u64,
     pub ingest: i64,
     pub ts: i64,
     pub pt: u32,
     pub cat: u32,
-}
-impl<'a> Ev<'a> {
-    #[inline]
-    fn eid(&self) -> B<'a> {
-        unsafe { first(self.line) }
-    }
-    #[inline]
-    fn user(&self) -> B<'a> {
-        unsafe { first_two(self.line).1 }
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -184,19 +177,19 @@ pub fn shard_of(h: u64, nshard: usize) -> usize {
 
 pub fn parse_events<'a>(c: B<'a>, ctx: &EvCtx<'_, 'a>, nshard: usize, tmp: &mut Vec<(Ev<'a>, u32)>) -> Parts<Ev<'a>> {
     tmp.clear();
-    for_lines(c, |line| {
-        let Some([eid, user, ts, ingest, typ, product, price]) = split::<7>(line) else { return };
+    let mut clock = TimestampParser::new();
+    for_records(c, |[eid, user, ts, ingest, typ, product, price]| {
         if eid.is_empty() {
             return;
         }
-        let Some(ingest) = parse_ts(ingest) else { return };
+        let Some(ingest) = clock.parse(ingest) else { return };
         let h = hash(eid);
-        let mut e = Ev { line: &line[0], ingest, ts: 0, pt: T_INVALID << 24, cat: 0 };
+        let mut e = Ev { eid, user, hash: h, ingest, ts: 0, pt: T_INVALID << 24, cat: 0 };
         'v: {
             if user.is_empty() || product.is_empty() {
                 break 'v;
             }
-            let Some(t) = parse_ts(ts) else { break 'v };
+            let Some(t) = clock.parse(ts) else { break 'v };
             if t < ctx.ws || t >= ctx.we {
                 break 'v;
             }
@@ -226,72 +219,59 @@ pub fn parse_events<'a>(c: B<'a>, ctx: &EvCtx<'_, 'a>, nshard: usize, tmp: &mut 
 #[derive(Default)]
 pub struct DedupBufs<'a> {
     tab: Tab,
-    base: Vec<u32>,
-    win: Vec<bool>,
     tmp: Vec<(Rec<'a>, u32)>,
 }
 
-pub fn dedup_route<'a>(parts: &[Parts<Ev<'a>>], s: usize, links: &LinkMap<'a>, npshard: usize, b: &mut DedupBufs<'a>) -> Parts<Rec<'a>> {
-    b.base.clear();
-    let mut total = 0usize;
-    for p in parts {
-        b.base.push(total as u32);
-        total += p.shard(s).len();
-    }
-    b.base.push(total as u32);
-    let base = &b.base;
-    let locate = |idx: u32| -> (usize, usize) {
-        let c = base.partition_point(|&x| x <= idx) - 1;
-        (c, (idx - base[c]) as usize)
-    };
+pub fn dedup_route<'a>(
+    parts: &[Parts<Ev<'a>>],
+    s: usize,
+    links: &LinkMap<'a>,
+    npshard: usize,
+    b: &mut DedupBufs<'a>,
+) -> Parts<Rec<'a>> {
+    let total = parts.iter().map(|p| p.shard(s).len()).sum();
     b.tab.reset(total);
-    b.win.clear();
-    b.win.resize(total, true);
-    for (ci, p) in parts.iter().enumerate() {
-        let v = p.shard(s);
-        for (i, e) in v.iter().enumerate() {
-            let eid = e.eid();
-            let eh = hash(eid);
-            let flat = base[ci] + i as u32;
-            let r = b.tab.find(eh, |idx| {
-                let (c, j) = locate(idx);
-                parts[c].shard(s)[j].eid() == eid
-            });
-            match r {
-                Ok((slot, idx)) => {
-                    let (c, j) = locate(idx);
-                    if e.ingest < parts[c].shard(s)[j].ingest {
-                        b.win[idx as usize] = false;
-                        b.tab.set(slot, eh, flat);
-                    } else {
-                        b.win[flat as usize] = false;
-                    }
+    // Table entries index the winners directly. A replacement keeps its slot,
+    // so invalid earlier copies still suppress later valid duplicates.
+    let mut winners = Vec::<&Ev>::with_capacity(total);
+    for e in parts.iter().flat_map(|p| p.shard(s)) {
+        match b.tab.find(e.hash, |idx| winners[idx as usize].eid == e.eid) {
+            Ok((_, idx)) => {
+                let previous = &mut winners[idx as usize];
+                if e.ingest < previous.ingest {
+                    *previous = e;
                 }
-                Err(slot) => b.tab.set(slot, eh, flat),
+            }
+            Err(slot) => {
+                b.tab.set(slot, e.hash, winners.len() as u32);
+                winners.push(e);
             }
         }
     }
     b.tmp.clear();
-    let mut k = 0usize;
-    for p in parts {
-        for e in p.shard(s) {
-            let w = b.win[k];
-            k += 1;
-            if !w || (e.pt >> 24) > T_PURCHASE {
-                continue;
-            }
-            let user = e.user();
-            let (name, nh) = links.name(user, hash(user));
-            b.tmp.push((Rec { name, nh, ts: e.ts, pt: e.pt, cat: e.cat }, shard_of(nh, npshard) as u32));
+    for e in winners {
+        if (e.pt >> 24) > T_PURCHASE {
+            continue;
         }
+        let (name, nh) = links.name(e.user, hash(e.user));
+        b.tmp.push((
+            Rec {
+                name,
+                nh,
+                ts: e.ts,
+                pt: e.pt,
+                cat: e.cat,
+            },
+            shard_of(nh, npshard) as u32,
+        ));
     }
     Parts::group(&b.tmp, npshard)
 }
 
-
 #[derive(Clone, Copy)]
 pub struct Ck0<'a> {
-    pub line: &'a u8,
+    pub cid: B<'a>,
+    pub user: B<'a>,
     pub ts: i64,
     pub camp: u32,
 }
@@ -300,7 +280,7 @@ pub struct Ck0<'a> {
 pub struct Ck<'a> {
     pub name: B<'a>,
     pub nh: u64,
-    pub line: &'a u8,
+    pub cid: B<'a>,
     pub ts: i64,
     pub camp: u32,
 }
@@ -308,17 +288,17 @@ pub struct Ck<'a> {
 pub fn parse_clicks<'a>(c: B<'a>, ws: i64, we: i64, campaigns: &Map<B<'a>, u32>) -> Vec<Ck0<'a>> {
     let lo = ws - 7 * DAY_MS;
     let mut v = Vec::with_capacity(count_lines(c) + 1);
-    for_lines(c, |line| {
-        let Some([cid, user, camp, ts]) = split::<4>(line) else { return };
+    let mut clock = TimestampParser::new();
+    for_records(c, |[cid, user, camp, ts]| {
         if cid.is_empty() || user.is_empty() {
             return;
         }
-        let Some(t) = parse_ts(ts) else { return };
+        let Some(t) = clock.parse(ts) else { return };
         if t < lo || t >= we {
             return;
         }
         let Some(&ci) = campaigns.get(camp) else { return };
-        v.push(Ck0 { line: &line[0], ts: t, camp: ci });
+        v.push(Ck0 { cid, user, ts: t, camp: ci });
     });
     v
 }
@@ -326,9 +306,9 @@ pub fn parse_clicks<'a>(c: B<'a>, ws: i64, we: i64, campaigns: &Map<B<'a>, u32>)
 pub fn route_clicks<'a>(v: &[Ck0<'a>], links: &LinkMap<'a>, npshard: usize, tmp: &mut Vec<(Ck<'a>, u32)>) -> Parts<Ck<'a>> {
     tmp.clear();
     for c in v {
-        let user = unsafe { first_two(c.line).1 };
+        let user = c.user;
         let (name, nh) = links.name(user, hash(user));
-        tmp.push((Ck { name, nh, line: c.line, ts: c.ts, camp: c.camp }, shard_of(nh, npshard) as u32));
+        tmp.push((Ck { name, nh, cid: c.cid, ts: c.ts, camp: c.camp }, shard_of(nh, npshard) as u32));
     }
     Parts::group(tmp, npshard)
 }
@@ -563,7 +543,7 @@ pub fn run_shard<'a>(recs: &[Parts<Rec<'a>>], cks: &[Parts<Ck<'a>>], p: usize, o
             k += 1;
             if pid != u32::MAX {
                 let q = &mut bf.pos[pid as usize];
-                bf.pc[*q as usize] = PC { ts: x.ts, cid: unsafe { first(x.line) }, camp: x.camp };
+                bf.pc[*q as usize] = PC { ts: x.ts, cid: x.cid, camp: x.camp };
                 *q += 1;
             }
         }
