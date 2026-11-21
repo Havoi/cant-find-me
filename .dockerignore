@@ -1,0 +1,15 @@
+*
+!Cargo.toml
+!Cargo.lock
+!src/
+!src/**
+!native/
+!native/*.cpp
+!native/*.hpp
+!native/build.sh
+!native/training.py
+!native/LICENSE
+!Dockerfile
+
+!wide/
+!wide/**

@@ -1,0 +1,10 @@
+Third-party source notices
+
+The AVX-512 implementation derives from Team 67's Express Lane and
+Js-Hwang1's modifications. See wide/LICENSE and wide/AGENTS.md.
+https://github.com/jason-scheffel/express-lane/tree/21d36dcbb35a89df7ad248657fc32da6c4d55854
+https://github.com/Js-Hwang1/buildathon_databricks/tree/23a13bb59e55a0096334b20b019d6a19b32a8c6c
+
+The native C++ implementation derives from the Fraun Shopping Sessions
+solver. See native/LICENSE.
+https://github.com/mliao0128/fraun-shopping-sessions/tree/dd510eadd036edcc10af568ad6dd3d656ae98f73
