@@ -10,9 +10,11 @@ RUN cc -O2 -march=x86-64 -c /tmp/choose.c -o /tmp/choose.o \
         -Clink-arg=/tmp/choose.o -Clink-arg=-Wl,--wrap=main \
         -Clink-arg="$(cc -print-libgcc-file-name)" -Clink-arg=-lc \
  && cp target/x86_64-unknown-linux-musl/release/pipeline /pipeline \
- && cargo rustc --locked --release --target x86_64-unknown-linux-musl -- -Ctarget-feature=+avx512ifma \
+ && CARGO_PROFILE_RELEASE_LTO=thin cargo rustc --locked --release --target x86_64-unknown-linux-musl -- -Ccodegen-units=4 -Ctarget-feature=+avx512ifma \
  && cp target/x86_64-unknown-linux-musl/release/pipeline /ifma \
- && strip /pipeline /ifma
+ && CARGO_PROFILE_RELEASE_LTO=thin cargo rustc --locked --release --target x86_64-unknown-linux-musl -- -Ccodegen-units=4 -Ctarget-feature=+avx512ifma,+avx512vbmi,+gfni \
+ && cp target/x86_64-unknown-linux-musl/release/pipeline /vbmi \
+ && strip /pipeline /ifma /vbmi
 
 FROM rust:1.85-bookworm AS portable
 WORKDIR /build
@@ -34,6 +36,7 @@ COPY --from=native /usr/local/bin/shopping-sessions /usr/local/libexec/shopping-
 COPY native/LICENSE /usr/share/doc/shopping-sessions/native-LICENSE
 COPY --from=wide-build /pipeline /usr/local/libexec/shopping-wide
 COPY --from=wide-build /ifma /usr/local/libexec/shopping-wide-ifma
+COPY --from=wide-build /vbmi /usr/local/libexec/shopping-wide-vbmi
 COPY wide/LICENSE /usr/share/doc/shopping-sessions/express-lane-LICENSE
 ENV MALLOC_CONF=thp:always,narenas:1
 ENV DATA_DIR=/data OUTPUT_DIR=/output SCRATCH_DIR=/scratch HOME=/scratch TMPDIR=/scratch NCPU=8

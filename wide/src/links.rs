@@ -236,7 +236,7 @@ use crate::sys::z::{self, Z};
 const IDX_SH: u32 = 18;
 const IDX_BITS: u64 = 0xFFFF_FFFF & !((1 << IDX_SH) - 1);
 const NET_MAX: usize = 512;
-const SORT_STRIDE: usize = 8;
+const SORT_STRIDE: usize = 1;
 
 #[inline(always)]
 fn sort_clicks(g: &G, s: &mut [[u64; 2]], sc: &mut Scratch) {
@@ -491,26 +491,126 @@ unsafe fn pos8(base: i64) -> Z {
     z::setr_epi64(base << s, (base + 1) << s, (base + 2) << s, (base + 3) << s, (base + 4) << s, (base + 5) << s, (base + 6) << s, (base + 7) << s)
 }
 
+mod short_click_sort {
+    use super::*;
+    #[inline(always)]
+    unsafe fn exchange(v: __m512i, partner: __m512i, upper: u8) -> __m512i {
+        let p = _mm512_permutexvar_epi64(partner, v);
+        _mm512_mask_max_epu64(_mm512_min_epu64(v, p), upper, v, p)
+    }
+    #[inline(always)]
+    pub(super) unsafe fn sort8(v: __m512i) -> __m512i {
+        let adjacent = _mm512_setr_epi64(1, 0, 3, 2, 5, 4, 7, 6);
+        let v = exchange(v, adjacent, 0xaa);
+        let v = exchange(v, _mm512_setr_epi64(3, 2, 1, 0, 7, 6, 5, 4), 0xcc);
+        let v = exchange(v, adjacent, 0xaa);
+        let v = exchange(v, _mm512_setr_epi64(7, 6, 5, 4, 3, 2, 1, 0), 0xf0);
+        let v = exchange(v, _mm512_setr_epi64(2, 3, 0, 1, 6, 7, 4, 5), 0xcc);
+        exchange(v, adjacent, 0xaa)
+    }
+    #[inline(always)]
+    pub(super) unsafe fn merge8(v: __m512i) -> __m512i {
+        let v = exchange(v, _mm512_setr_epi64(4, 5, 6, 7, 0, 1, 2, 3), 0xf0);
+        let v = exchange(v, _mm512_setr_epi64(2, 3, 0, 1, 6, 7, 4, 5), 0xcc);
+        exchange(v, _mm512_setr_epi64(1, 0, 3, 2, 5, 4, 7, 6), 0xaa)
+    }
+    #[inline(always)]
+    pub(super) unsafe fn even(a: __m512i, b: __m512i) -> __m512i {
+        _mm512_permutex2var_epi64(a, _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14), b)
+    }
+    #[inline(always)]
+    pub(super) unsafe fn odd(a: __m512i, b: __m512i) -> __m512i {
+        _mm512_permutex2var_epi64(a, _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15), b)
+    }
+    #[inline(always)]
+    pub(super) unsafe fn rows_lo(k: __m512i, v: __m512i) -> __m512i {
+        _mm512_permutex2var_epi64(k, _mm512_setr_epi64(0, 8, 1, 9, 2, 10, 3, 11), v)
+    }
+    #[inline(always)]
+    pub(super) unsafe fn rows_hi(k: __m512i, v: __m512i) -> __m512i {
+        _mm512_permutex2var_epi64(k, _mm512_setr_epi64(4, 12, 5, 13, 6, 14, 7, 15), v)
+    }
+    #[inline(always)]
+    pub(super) unsafe fn prev(a: __m512i, before: __m512i) -> __m512i {
+        _mm512_alignr_epi64::<7>(a, before)
+    }
+    #[inline(always)]
+    pub(super) unsafe fn rev8(a: __m512i) -> __m512i {
+        _mm512_permutexvar_epi64(_mm512_setr_epi64(7, 6, 5, 4, 3, 2, 1, 0), a)
+    }
+    #[inline(always)]
+    pub(super) unsafe fn tie_mask(k: __m512i, prev: __m512i) -> u8 {
+        let x = _mm512_xor_si512(k, prev);
+        _mm512_testn_epi64_mask(x, _mm512_set1_epi64(-1i64 << 32))
+            & _mm512_test_epi64_mask(x, _mm512_set1_epi64(0xffff_fff0))
+    }
+    #[inline(always)]
+    pub(super) unsafe fn pos8(start: i64) -> __m512i {
+        _mm512_slli_epi64::<IDX_SH>(_mm512_add_epi64(_mm512_set1_epi64(start),
+            _mm512_setr_epi64(0, 1, 2, 3, 4, 5, 6, 7)))
+    }
+}
+
+#[inline(always)]
+unsafe fn sort_up_to_four(g: &G, src: *const [u64; 2], dst: *mut [u64; 2], n: usize) {
+    let q = src as *const i64;
+    let tail = if n == 3 { 3 } else { 15 };
+    let a = _mm256_loadu_si256(q.cast());
+    let b = _mm256_maskz_loadu_epi64(tail, q.add(4));
+    let keys = _mm256_permutex2var_epi64(a, _mm256_setr_epi64x(0, 2, 4, 6), b);
+    let vals = _mm256_permutex2var_epi64(a, _mm256_setr_epi64x(1, 3, 5, 7), b);
+    let idx = _mm256_set1_epi64x(IDX_BITS as i64);
+    if _mm256_test_epi64_mask(keys, idx) != 0 {
+        return slow_from(g, src, dst, n);
+    }
+    let active = (1u8 << n) - 1;
+    let positions = _mm256_setr_epi64x(0, 1 << IDX_SH, 2 << IDX_SH, 3 << IDX_SH);
+    let mut k = _mm256_mask_or_epi64(_mm256_set1_epi64x(-1), active, keys, positions);
+    macro_rules! exchange {
+        ($perm:expr, $mask:expr) => {{
+            let partner = _mm256_permute4x64_epi64::<$perm>(k);
+            k = _mm256_mask_max_epu64(_mm256_min_epu64(k, partner), $mask, k, partner);
+        }};
+    }
+    exchange!(0xb1, 0b1010);
+    exchange!(0x1b, 0b1100);
+    exchange!(0xb1, 0b1010);
+    let ordered = _mm256_permutexvar_epi64(_mm256_srli_epi64::<{ IDX_SH as i32 }>(k), vals);
+    k = _mm256_andnot_si256(idx, k);
+    let dup = _mm256_xor_si256(k, _mm256_permute4x64_epi64::<0x90>(k));
+    let tie = _mm256_testn_epi64_mask(dup, _mm256_set1_epi64x(-1i64 << 32))
+        & _mm256_test_epi64_mask(dup, _mm256_set1_epi64x(0xffff_fff0)) & active & !1;
+    let target = dst.cast::<i64>();
+    let lo = _mm256_permutex2var_epi64(k, _mm256_setr_epi64x(0, 4, 1, 5), ordered);
+    let hi = _mm256_permutex2var_epi64(k, _mm256_setr_epi64x(2, 6, 3, 7), ordered);
+    _mm256_storeu_si256(target.cast(), lo);
+    _mm256_mask_storeu_epi64(target.add(4), tail, hi);
+    if tie != 0 {
+        fix_ties(g, std::slice::from_raw_parts_mut(dst, n));
+    }
+}
+
 #[inline(always)]
 unsafe fn sort_r1(g: &G, src: *const [u64; 2], p: *mut [u64; 2], n: usize) {
+    if n <= 4 { return sort_up_to_four(g, src, p, n); }
     let q = p as *mut u64;
     let sq = src as *const u64;
     let m = (1u32 << (2 * n)) - 1;
     let km = ((1u32 << n) - 1) as u8;
-    let idxb = z::set1_epi64(IDX_BITS as i64);
-    let lo = z::maskz_loadu_epi64(m as u8, sq);
-    let hi = z::maskz_loadu_epi64((m >> 8) as u8, sq.add(8));
-    let kv = z::even_epi64(lo, hi);
-    let vv = z::odd_epi64(lo, hi);
-    if z::test_epi64_mask(kv, idxb) != 0 {
+    let idxb = _mm512_set1_epi64(IDX_BITS as i64);
+    let lo = _mm512_maskz_loadu_epi64(m as u8, sq.cast());
+    let hi = _mm512_maskz_loadu_epi64((m >> 8) as u8, sq.add(8).cast());
+    let kv = short_click_sort::even(lo, hi);
+    let vv = short_click_sort::odd(lo, hi);
+    if _mm512_test_epi64_mask(kv, idxb) != 0 {
         return slow_from(g, src, p, n);
     }
-    let k = sort8(z::mask_or_epi64(z::set1_epi64(-1), km, kv, pos8(0)));
-    let pv = z::permutexvar_epi64(z::srli_epi64::<{ IDX_SH as i32 }>(k), vv);
-    let kc = z::andnot(idxb, k);
-    let tie = tie_mask(kc, z::prev_epi64(kc, kc)) & km & 0xFE;
-    z::mask_storeu_epi64(q, m as u8, rows_lo(kc, pv));
-    z::mask_storeu_epi64(q.add(8), (m >> 8) as u8, rows_hi(kc, pv));
+    let k = short_click_sort::sort8(_mm512_mask_or_epi64(_mm512_set1_epi64(-1), km, kv, short_click_sort::pos8(0)));
+    let pv = _mm512_permutexvar_epi64(_mm512_srli_epi64::<IDX_SH>(k), vv);
+    let kc = _mm512_andnot_si512(idxb, k);
+    let tie = short_click_sort::tie_mask(kc, short_click_sort::prev(kc, kc)) & km & 0xFE;
+    _mm512_mask_storeu_epi64(q.cast(), m as u8, short_click_sort::rows_lo(kc, pv));
+    _mm512_mask_storeu_epi64(q.add(8).cast(), (m >> 8) as u8, short_click_sort::rows_hi(kc, pv));
     if tie != 0 {
         fix_ties(g, std::slice::from_raw_parts_mut(p, n));
     }
@@ -522,31 +622,31 @@ unsafe fn sort_r2(g: &G, src: *const [u64; 2], p: *mut [u64; 2], n: usize) {
     let sq = src as *const u64;
     let m1 = (1u32 << (2 * (n - 8))) - 1;
     let km1 = ((1u32 << (n - 8)) - 1) as u8;
-    let idxb = z::set1_epi64(IDX_BITS as i64);
-    let lo0 = z::loadu(sq);
-    let hi0 = z::loadu(sq.add(8));
-    let lo1 = z::maskz_loadu_epi64(m1 as u8, sq.add(16));
-    let hi1 = z::maskz_loadu_epi64((m1 >> 8) as u8, sq.add(24));
-    let kv0 = z::even_epi64(lo0, hi0);
-    let v0 = z::odd_epi64(lo0, hi0);
-    let kv1 = z::even_epi64(lo1, hi1);
-    let v1 = z::odd_epi64(lo1, hi1);
-    if z::test_epi64_mask(z::or(kv0, kv1), idxb) != 0 {
+    let idxb = _mm512_set1_epi64(IDX_BITS as i64);
+    let lo0 = _mm512_loadu_si512(sq.cast());
+    let hi0 = _mm512_loadu_si512(sq.add(8).cast());
+    let lo1 = _mm512_maskz_loadu_epi64(m1 as u8, sq.add(16).cast());
+    let hi1 = _mm512_maskz_loadu_epi64((m1 >> 8) as u8, sq.add(24).cast());
+    let kv0 = short_click_sort::even(lo0, hi0);
+    let v0 = short_click_sort::odd(lo0, hi0);
+    let kv1 = short_click_sort::even(lo1, hi1);
+    let v1 = short_click_sort::odd(lo1, hi1);
+    if _mm512_test_epi64_mask(_mm512_or_si512(kv0, kv1), idxb) != 0 {
         return slow_from(g, src, p, n);
     }
-    let a = sort8(z::or(kv0, pos8(0)));
-    let b = rev8(sort8(z::mask_or_epi64(z::set1_epi64(-1), km1, kv1, pos8(8))));
-    let k0 = merge8(z::min_epu64(a, b));
-    let k1 = merge8(z::max_epu64(a, b));
-    let p0 = z::permutex2var_epi64(v0, z::srli_epi64::<{ IDX_SH as i32 }>(k0), v1);
-    let p1 = z::permutex2var_epi64(v0, z::srli_epi64::<{ IDX_SH as i32 }>(k1), v1);
-    let kc0 = z::andnot(idxb, k0);
-    let kc1 = z::andnot(idxb, k1);
-    let tie = (tie_mask(kc0, z::prev_epi64(kc0, kc0)) & 0xFE) | (tie_mask(kc1, z::prev_epi64(kc1, kc0)) & km1);
-    z::storeu(q, rows_lo(kc0, p0));
-    z::storeu(q.add(8), rows_hi(kc0, p0));
-    z::mask_storeu_epi64(q.add(16), m1 as u8, rows_lo(kc1, p1));
-    z::mask_storeu_epi64(q.add(24), (m1 >> 8) as u8, rows_hi(kc1, p1));
+    let a = short_click_sort::sort8(_mm512_or_si512(kv0, short_click_sort::pos8(0)));
+    let b = short_click_sort::rev8(short_click_sort::sort8(_mm512_mask_or_epi64(_mm512_set1_epi64(-1), km1, kv1, short_click_sort::pos8(8))));
+    let k0 = short_click_sort::merge8(_mm512_min_epu64(a, b));
+    let k1 = short_click_sort::merge8(_mm512_max_epu64(a, b));
+    let p0 = _mm512_permutex2var_epi64(v0, _mm512_srli_epi64::<IDX_SH>(k0), v1);
+    let p1 = _mm512_permutex2var_epi64(v0, _mm512_srli_epi64::<IDX_SH>(k1), v1);
+    let kc0 = _mm512_andnot_si512(idxb, k0);
+    let kc1 = _mm512_andnot_si512(idxb, k1);
+    let tie = (short_click_sort::tie_mask(kc0, short_click_sort::prev(kc0, kc0)) & 0xFE) | (short_click_sort::tie_mask(kc1, short_click_sort::prev(kc1, kc0)) & km1);
+    _mm512_storeu_si512(q.cast(), short_click_sort::rows_lo(kc0, p0));
+    _mm512_storeu_si512(q.add(8).cast(), short_click_sort::rows_hi(kc0, p0));
+    _mm512_mask_storeu_epi64(q.add(16).cast(), m1 as u8, short_click_sort::rows_lo(kc1, p1));
+    _mm512_mask_storeu_epi64(q.add(24).cast(), (m1 >> 8) as u8, short_click_sort::rows_hi(kc1, p1));
     if tie != 0 {
         fix_ties(g, std::slice::from_raw_parts_mut(p, n));
     }
@@ -640,20 +740,25 @@ unsafe fn sort_users(g: &G, off: *const u32, ua: usize, ub: usize, sc: &mut Scra
     }
     let (l2, l8, l16, lbig) = (sc.l2.as_mut_ptr(), sc.l8.as_mut_ptr(), sc.l16.as_mut_ptr(), sc.lbig.as_mut_ptr());
     let (mut n2, mut n8, mut n16, mut nbig) = (0usize, 0usize, 0usize, 0usize);
-    let iota = z::iota_epi32();
+    let iota = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    let append = |ptr: *mut u32, mask: u16, lanes: __m512i| {
+        // The scratch lists reserve a full spare vector for the trailing store.
+        _mm512_storeu_si512(ptr.cast(), _mm512_maskz_compress_epi32(mask, lanes));
+        mask.count_ones() as usize
+    };
     let mut u = ua;
     while u < ub {
         let tail: u16 = if ub - u >= 16 { 0xFFFF } else { ((1u32 << (ub - u)) - 1) as u16 };
-        let n = z::sub_epi32(z::maskz_loadu_epi32(tail, off.add(u + 1)), z::maskz_loadu_epi32(tail, off.add(u)));
-        let uv = z::add_epi32(z::set1_epi32(u as i32), iota);
-        let m2 = z::cmpeq_epi32_mask(n, z::set1_epi32(2));
-        let m8 = z::cmple_epu32_mask(z::sub_epi32(n, z::set1_epi32(3)), z::set1_epi32(5));
-        let m16 = z::cmple_epu32_mask(z::sub_epi32(n, z::set1_epi32(9)), z::set1_epi32(7));
-        let mb = z::cmpge_epu32_mask(n, z::set1_epi32(17));
-        n2 += z::compress_store_epi32(l2.add(n2), m2, uv);
-        n8 += z::compress_store_epi32(l8.add(n8), m8, uv);
-        n16 += z::compress_store_epi32(l16.add(n16), m16, uv);
-        nbig += z::compress_store_epi32(lbig.add(nbig), mb, uv);
+        let n = _mm512_sub_epi32(_mm512_maskz_loadu_epi32(tail, off.add(u + 1).cast()), _mm512_maskz_loadu_epi32(tail, off.add(u).cast()));
+        let uv = _mm512_add_epi32(_mm512_set1_epi32(u as i32), iota);
+        let m2 = _mm512_cmpeq_epi32_mask(n, _mm512_set1_epi32(2));
+        let m8 = _mm512_cmple_epu32_mask(_mm512_sub_epi32(n, _mm512_set1_epi32(3)), _mm512_set1_epi32(5));
+        let m16 = _mm512_cmple_epu32_mask(_mm512_sub_epi32(n, _mm512_set1_epi32(9)), _mm512_set1_epi32(7));
+        let mb = _mm512_cmpge_epu32_mask(n, _mm512_set1_epi32(17));
+        n2 += append(l2.add(n2), m2, uv);
+        n8 += append(l8.add(n8), m8, uv);
+        n16 += append(l16.add(n16), m16, uv);
+        nbig += append(lbig.add(nbig), mb, uv);
         u += 16;
     }
     let row = |u: u32| -> (*mut [u64; 2], usize) {

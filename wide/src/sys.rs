@@ -296,7 +296,7 @@ fn worker(tid: usize, nt: usize) -> ! {
     #[cfg(feature = "tl")]
     tl::mark(tid, 10);
     if PIN_AT_START.load(Ordering::Relaxed) && tid < 16 {
-        let order = crate::parse::cpu_order();
+        let order = crate::parse::cpu_order(nt);
         if !order.is_empty() && pin_to(order[tid % order.len()]) {
             PINNED[tid].store(true, Ordering::Release);
         }

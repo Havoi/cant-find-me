@@ -6,6 +6,10 @@ use std::sync::atomic::Ordering;
 
 pub const CHUNK: usize = 4096;
 pub const LINK_OFF: usize = 4032;
+pub fn event_chunk_group(threads: usize) -> usize {
+    let mean_full_pages = BSIZE / (LINK_OFF / 16) / threads.max(1);
+    1 << mean_full_pages.max(1).ilog2()
+}
 const BLOCK: usize = 2 << 20;
 pub static mut NT: bool = true;
 pub static mut RELEASE: bool = true;
@@ -39,13 +43,16 @@ pub struct Part {
     blk: *mut u8,
     blk_end: *mut u8,
     popw: bool,
+    event_group: usize,
+    large_blk: *mut u8,
+    large_end: *mut u8,
     pend: Vec<Line>,
 }
 const NOCHUNK: usize = LINK_OFF;
 unsafe impl Send for Part {}
 impl Part {
     pub fn empty() -> Part {
-        Part { lines: Vec::new(), fill: Vec::new(), cur: Vec::new(), nch: Vec::new(), n: Vec::new(), head: Vec::new(), arena: std::ptr::null(), blk: std::ptr::null_mut(), blk_end: std::ptr::null_mut(), popw: false, pend: Vec::new() }
+        Part { lines: Vec::new(), fill: Vec::new(), cur: Vec::new(), nch: Vec::new(), n: Vec::new(), head: Vec::new(), arena: std::ptr::null(), blk: std::ptr::null_mut(), blk_end: std::ptr::null_mut(), popw: false, event_group: 1, large_blk: std::ptr::null_mut(), large_end: std::ptr::null_mut(), pend: Vec::new() }
     }
     pub fn new_unbound(nb: usize) -> Part {
         Part::build(std::ptr::null(), nb)
@@ -68,6 +75,9 @@ impl Part {
             blk: std::ptr::null_mut(),
             blk_end: std::ptr::null_mut(),
             popw: popw(),
+            event_group: 1,
+            large_blk: std::ptr::null_mut(),
+            large_end: std::ptr::null_mut(),
             pend: vec![Line([0; 8]); 72],
         }
     }
@@ -115,8 +125,14 @@ impl Part {
             }};
         }
         if m == (if n >= 64 { !0 } else { (1u64 << n) - 1 }) {
-            for i in 0..n {
-                row!(i);
+            if self.lines.len() >= 2048 && n == 64 {
+                for i in 0..56 {
+                    _mm_prefetch::<_MM_HINT_T0>(*lp.add(i + 8) as *const i8);
+                    row!(i);
+                }
+                for i in 56..64 { row!(i); }
+            } else {
+                for i in 0..n { row!(i); }
             }
         } else {
             let mut m = m;
@@ -178,15 +194,28 @@ impl Part {
     }
     #[inline(never)]
     unsafe fn new_chunk(&mut self, b: usize, old: *mut u64) -> *mut u64 {
-        if self.blk == self.blk_end {
-            self.blk = (*self.arena).alloc(BLOCK);
-            self.blk_end = self.blk.add(BLOCK);
-            if self.popw {
-                madvise(self.blk, BLOCK, MADV_POPULATE_WRITE);
+        let used = self.nch[b] as usize;
+        let n = if self.event_group > 1 && (2..=self.event_group).contains(&used) {
+            old.byte_add(CHUNK - LINK_OFF)
+        } else {
+            // Leave a new bucket on a single page. Once full, give it a
+            // contiguous run proportional to one producer's winner-table share.
+            let (blk, end, pages) = if used == 1 && self.event_group > 1 {
+                (&mut self.large_blk, &mut self.large_end, self.event_group)
+            } else {
+                (&mut self.blk, &mut self.blk_end, 1)
+            };
+            if *blk == *end {
+                *blk = (*self.arena).alloc(BLOCK);
+                *end = (*blk).add(BLOCK);
+                if self.popw {
+                    madvise(*blk, BLOCK, MADV_POPULATE_WRITE);
+                }
             }
-        }
-        let n = self.blk as *mut u64;
-        self.blk = self.blk.add(CHUNK);
+            let page = *blk;
+            *blk = page.add(pages * CHUNK);
+            page.cast::<u64>()
+        };
         if old as usize == NOCHUNK {
             self.head[b] = n;
         } else {
@@ -677,7 +706,6 @@ unsafe fn ev_vec<const TSB: bool>(eb: &EvBatch, out: &mut Out, n: usize, p: &EvP
     let ts_bad = s(TS_BAD as u64);
     let ws = s(p.ws as u64);
     let wlen = s(p.wlen);
-    let empty = s(ID_EMPTY);
     let zero = _mm512_setzero_si512();
     let p24 = s(0xFF_FFFF);
     let day = s(DAY_MS as u64);
@@ -704,7 +732,7 @@ unsafe fn ev_vec<const TSB: bool>(eb: &EvBatch, out: &mut Out, n: usize, p: &EvP
         let uid = _mm512_load_si512(eb.uid.as_ptr().add(j) as *const __m512i);
         let pp = _mm512_load_si512(eb.pp.as_ptr().add(j) as *const __m512i);
         let price = _mm512_and_si512(_mm512_srli_epi64::<32>(pp), p24);
-        let valid = _mm512_cmpneq_epi64_mask(uid, empty);
+        let valid = _mm512_cmpneq_epi64_mask(uid, ones);
         let valid = _mm512_mask_cmplt_epu64_mask(valid, rel, wlen);
         let valid = _mm512_mask_cmpgt_epi64_mask(valid, pp, ones);
         let valid = _mm512_mask_cmple_epi64_mask(valid, _mm512_sub_epi64(ingr, ts), day);
@@ -714,6 +742,12 @@ unsafe fn ev_vec<const TSB: bool>(eb: &EvBatch, out: &mut Out, n: usize, p: &EvP
         let normal = _mm512_mask_cmplt_epu64_mask(_mm512_mask_cmplt_epu64_mask(_mm512_cmplt_epu64_mask(uid, lim40), user, ucap), alias, nal);
         let pm = _mm512_mask_cmpneq_epi64_mask(valid, price, zero);
         let w0v = _mm512_or_si512(_mm512_or_si512(_mm512_slli_epi64::<33>(rel), _mm512_slli_epi64::<9>(price)), alias);
+        let w0v = if pm != 0 {
+            let product = _mm512_min_epu64(_mm512_and_si512(pp,_mm512_set1_epi64(u32::MAX as i64)),_mm512_set1_epi64(PBOUND as i64));
+            let raw = _mm512_mask_i64gather_epi32::<1>(_mm256_setzero_si256(),pm,product,p.ptab.cast());
+            let cat = _mm512_cvtepu32_epi64(_mm256_and_si256(raw,_mm256_set1_epi32(255)));
+            _mm512_or_si512(w0v,_mm512_slli_epi64::<4>(cat))
+        } else { w0v };
         let w0v = _mm512_mask_blend_epi64(valid, ones, w0v);
         let userv = _mm512_maskz_mov_epi64(valid, user);
         let v = unscr(mul8(eid, binv), ekey);
@@ -726,7 +760,6 @@ unsafe fn ev_vec<const TSB: bool>(eb: &EvBatch, out: &mut Out, n: usize, p: &EvP
         _mm512_store_si512(out.ob.as_mut_ptr().add(j).cast(), bv);
         _mm512_store_si512(out.lp.as_mut_ptr().add(j).cast(), _mm512_add_epi64(_mm512_slli_epi64::<6>(bv), lines));
         kst(mk[0].as_mut_ptr(), g, bad);
-        kst(mk[1].as_mut_ptr(), g, pm);
         kst(mk[2].as_mut_ptr(), g, ok);
         j += 8;
         g += 1;
@@ -735,13 +768,6 @@ unsafe fn ev_vec<const TSB: bool>(eb: &EvBatch, out: &mut Out, n: usize, p: &EvP
     let badb = u64::from_le_bytes(mk[0]);
     let okb = u64::from_le_bytes(mk[2]) & nm;
     let spb = !okb & nm;
-    let mut pmb = u64::from_le_bytes(mk[1]) & nm;
-    while pmb != 0 {
-        let i = pmb.trailing_zeros() as usize;
-        pmb &= pmb - 1;
-        let prod = (*eb.pp.get_unchecked(i) as u32 as usize).min(PBOUND);
-        out.rec.get_unchecked_mut(i)[0] |= (*p.ptab.add(prod) as u64) << 4;
-    }
     (okb, spb, badb & nm != 0)
 }
 
@@ -1886,7 +1912,7 @@ unsafe fn read_at(fd: i32, dst: *mut u8, n: usize, off: usize, flen: usize) -> u
     got
 }
 
-pub(crate) fn cpu_order() -> &'static Vec<usize> {
+pub(crate) fn cpu_order(workers: usize) -> &'static Vec<usize> {
     static O: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
     O.get_or_init(|| {
         let mut m = [0u64; 16];
@@ -1896,7 +1922,7 @@ pub(crate) fn cpu_order() -> &'static Vec<usize> {
         }
         let allowed: Vec<usize> = (0..1024).filter(|&c| m[c / 64] >> (c % 64) & 1 != 0).collect();
         let mut seen = vec![false; 1024];
-        let mut out = Vec::new();
+        let mut ranked = Vec::with_capacity(allowed.len());
         for &c in &allowed {
             if seen[c] {
                 continue;
@@ -1917,14 +1943,18 @@ pub(crate) fn cpu_order() -> &'static Vec<usize> {
             if !has_c {
                 grp = vec![c];
             }
+            let mut sibling = 0usize;
             for x in grp {
                 if x < 1024 && !seen[x] && m[x / 64] >> (x % 64) & 1 != 0 {
                     seen[x] = true;
-                    out.push(x);
+                    ranked.push((sibling, x));
+                    sibling += 1;
                 }
             }
         }
-        out
+        // Fill distinct physical cores before assigning another worker to a sibling.
+        if allowed.len() > workers { ranked.sort_unstable(); }
+        ranked.into_iter().map(|(_, cpu)| cpu).collect()
     })
 }
 
@@ -2104,7 +2134,7 @@ pub fn stage1(g: &G, tid: usize) {
     let mut saved = [0u64; 16];
     let pre = tid >= 1 && tid < 16 && crate::sys::PINNED[tid].load(Ordering::Acquire);
     let pinned = d.pin != 0 && !pre && {
-        let o = cpu_order();
+        let o = cpu_order(g.nt);
         !o.is_empty() && unsafe { syscall(204, 0i32, 128usize, saved.as_mut_ptr()) } > 0 && {
             let cpu = o[tid % o.len()];
             let mut m = [0u64; 16];
@@ -2122,6 +2152,7 @@ pub fn stage1(g: &G, tid: usize) {
         t.ev = Part::new(&g.ev_arena, g.nb);
         t.us = Part::new(&g.us_arena, g.nub);
     }
+    t.ev.event_group = event_chunk_group(g.nt);
     #[cfg(feature = "tl")]
     crate::sys::tl::mark(tid, 7);
     if !CORE_READY.load(Ordering::Relaxed) {

@@ -345,7 +345,7 @@ pub fn setup(data: &str, nt: usize, check: bool) -> G {
     let nb = (ecap as usize) >> BB;
     let nub = (ucap as usize) >> UB;
     let blk = 2usize << 20;
-    let ev_arena = Arena::new(ev_bytes / 28 * 16 + nt * nb * 4096 + nt * blk + (16 << 20));
+    let ev_arena = Arena::new(ev_bytes / 28 * 16 + nt * nb * 4096 * crate::parse::event_chunk_group(nt) + 2 * nt * blk + (16 << 20));
     let us_arena = Arena::new((ck_bytes / 10 + lk_bytes / 6) * 16 + nt * nub * 4096 + nt * blk + (16 << 20));
     let row_cap = ev_bytes / 40 / nt * 2 + 65536;
     let nd = ((we - ws + ws.rem_euclid(DAY_MS) + DAY_MS - 1) / DAY_MS) as usize;
@@ -775,7 +775,7 @@ pub fn setup_par(data: &str, nt: usize, check: bool) -> G {
             pparts[i - q_p].set(products_part(&body[a..b]));
         } else if i == q_ord {
             if crate::parse::pin_mode() != 0 {
-                crate::parse::cpu_order();
+                crate::parse::cpu_order(nt);
             }
         } else if i >= q_core {
             let nc = camps.get().2;
@@ -965,7 +965,7 @@ pub fn setup_par(data: &str, nt: usize, check: bool) -> G {
     let nb = (ecap as usize) >> BB;
     let nub = (ucap as usize) >> UB;
     let blk = 2usize << 20;
-    let ev_arena = Arena::new(ev_bytes / 28 * 16 + nt * nb * 4096 + nt * blk + (16 << 20));
+    let ev_arena = Arena::new(ev_bytes / 28 * 16 + nt * nb * 4096 * crate::parse::event_chunk_group(nt) + 2 * nt * blk + (16 << 20));
     let us_arena = Arena::new((ck_bytes / 10 + lk_bytes / 6) * 16 + nt * nub * 4096 + nt * blk + (16 << 20));
     let mut t = Vec::with_capacity(nt);
     for c in &cores {

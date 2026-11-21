@@ -6,9 +6,12 @@ int main(int argc, char **argv) {
     (void)argc;
     const char *program = "/usr/local/libexec/shopping-generic";
     if (__builtin_cpu_supports("x86-64-v4") && __builtin_cpu_supports("avx512vnni")) {
-        program = __builtin_cpu_supports("avx512ifma")
-            ? "/usr/local/libexec/shopping-wide-ifma"
-            : "/usr/local/libexec/shopping-wide";
+        program = "/usr/local/libexec/shopping-wide";
+        if (__builtin_cpu_supports("avx512ifma")) {
+            program = (__builtin_cpu_supports("avx512vbmi") && __builtin_cpu_supports("gfni"))
+                ? "/usr/local/libexec/shopping-wide-vbmi"
+                : "/usr/local/libexec/shopping-wide-ifma";
+        }
     } else if (__builtin_cpu_supports("x86-64-v3")) {
         program = "/usr/local/libexec/shopping-native";
         if (setenv("LD_PRELOAD", "/usr/lib/x86_64-linux-gnu/libjemalloc.so.2", 0) != 0) {
